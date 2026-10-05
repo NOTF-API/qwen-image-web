@@ -247,10 +247,21 @@ def _round16(v: int) -> int:
 
 
 def resolve_size(size=None, aspect_ratio=None, long_side=None,
-                 ref_wh=None) -> tuple:
-    """返回 (width, height)，16 的倍数，长边不超过 MAX_SIDE"""
+                 ref_wh=None, width=None, height=None) -> tuple:
+    """返回 (width, height)，16 的倍数，长边不超过 MAX_SIDE
+
+    优先级: ``size`` > ``width``/``height`` > ``aspect_ratio``+``long_side`` > 参考图比例 > 正方形。
+
+    ``width``/``height`` 是 OpenAI 风格的写法, 以前这里不认, 传了会被静默忽略并退回
+    默认 1024x1024(调用方看不出自己写错了)。现在显式支持。
+    """
     long_side = long_side or DEFAULT_LONG_SIDE
     capped = False
+    if not size and width and height:
+        try:
+            size = f"{int(width)}x{int(height)}"
+        except (TypeError, ValueError):
+            raise ValueError(f"width/height 需为正整数，收到: {width!r}x{height!r}")
     if size:
         s = str(size).lower().replace("*", "x").replace(" ", "")
         try:
@@ -322,12 +333,28 @@ def _b64_to_pil(data: str):
     return img
 
 
+def _looks_like_b64(s: str) -> bool:
+    """是否像 base64 数据(而不是文件路径)。
+
+    早先这里用「长度 > 256」来判断, 于是任何压得足够小的图(纯色小 PNG 只要几十个
+    字符)都会被当成文件名, 报「找不到本站图片: <一串 base64>」。改用字符集判断:
+    base64 字母表里没有 ``.`` / ``:`` / ``\\``, 所以带扩展名的路径一定不会命中。
+    """
+    if len(s) < 16:
+        return False
+    if any(ch in s for ch in ".:\\"):
+        return False
+    # 显式列 base64 字母表(不能用 str.isalnum(), 它对中文等也返回 True)
+    return all(ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+               "0123456789+/=\r\n\t " for ch in s)
+
+
 def _ref_source_to_pil(src: str):
-    """参考图来源: base64 / data URL / 本站产物路径(/outputs/xxx.png 或绝对路径)。"""
+    """参考图来源: base64 / data URL / 本站产物路径(/outputs/xxx.png)。"""
     if not isinstance(src, str) or not src.strip():
         raise ValueError("参考图需为 base64 字符串或本站图片路径")
     s = src.strip()
-    if s.startswith("data:") or len(s) > 256:
+    if s.startswith("data:") or _looks_like_b64(s):
         return _b64_to_pil(s)
     if s.startswith(("http://", "https://")):
         # 只允许指回本站的产物, 避免服务被当成任意 URL 抓取器
@@ -363,8 +390,11 @@ def _filter_kwargs(fn, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _save_output(image, base_url: str, meta: dict) -> dict:
-    """把结果写进 outputs/ 并返回 OpenAI 风格条目(带本地路径, 便于队列持久化)。"""
+def _save_output(image, base_url: str, meta: dict, response_format: str = "url") -> dict:
+    """把结果写进 outputs/ 并返回 OpenAI 风格条目(带本地路径, 便于队列持久化)。
+
+    ``response_format="b64_json"`` 时额外带上 base64(文件照旧落盘, 便于继续编辑/下载)。
+    """
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     raw = buf.getvalue()
@@ -372,6 +402,8 @@ def _save_output(image, base_url: str, meta: dict) -> dict:
     path = OUTPUT_DIR / name
     path.write_bytes(raw)
     item = {"url": f"{base_url}outputs/{name}", "path": str(path)}
+    if str(response_format).lower() == "b64_json":
+        item["b64_json"] = base64.b64encode(raw).decode()
     item.update(meta)
     return item
 
@@ -382,22 +414,122 @@ def _oom_reset():
     gc.collect()
 
 
+# offload 状态被 OOM 打断后会「中毒」: 之后每次都报
+#   Expected all tensors to be on the same device ...
+# 而且**不重载管线就永远好不了**(2026-10-01 实测 3/3 必现, 连不取消的正常请求也失败)。
+# 根因是 enable_model_cpu_offload 的 hook 记录了「哪些模块在 GPU 上」, OOM 中断搬移后
+# 这个记录和真实驻留不一致。empty_cache() 清不掉这种逻辑状态, 只能重建管线。
+OFFLOAD_POISONED = {"at": 0, "err": ""}
+POISON_SIGNATURES = ("tensors to be on the same device",
+                     "expected all tensors to be on the same device",
+                     "not on the same device",
+                     "but expected on cpu",
+                     "but expected on cuda")
+
+
+def _is_offload_poison(err) -> bool:
+    """这个异常是否说明 offload 状态已损坏(而非普通 OOM)。"""
+    msg = str(err).lower()
+    return any(sig in msg for sig in POISON_SIGNATURES)
+
+
+def _recover_pipeline(reason: str) -> None:
+    """重建管线以恢复 offload 状态。
+
+    代价是一次冷加载(实测 ~37 秒), 但比重启服务轻得多 —— 模型文件、队列、
+    已完成任务都不受影响, 这正是队列持久化存在的意义。
+    """
+    global PIPE
+    log.error("模型 offload 状态已损坏(%s), 正在重建管线(约 30~60 秒)…", reason)
+    t0 = time.time()
+    STATE["load"] = "loading"
+    with LOAD_LOCK:
+        old = PIPE
+        PIPE = None                     # 先摘掉, 避免并发请求用到半死的管线
+        try:
+            if old is not None:
+                try:
+                    old.unload()
+                except Exception:
+                    pass
+                del old
+            _oom_reset()
+            PIPE = load_pipeline()
+            STATE["load"] = "ready"
+            STATE["loaded_at"] = time.time()
+            # 注意: 这里**不要**清 OFFLOAD_POISONED["at"] —— 它是给 /health 看的
+            # 「最近一次自愈时间」, 清掉了运维就看不出服务曾经坏过、是怎么恢复的。
+            # 真正要留意的是它长时间不更新却一直有请求失败(见 _recover_pipeline 开头日志)。
+            OFFLOAD_POISONED["err"] = ""
+            log.info("管线重建完成, 用时 %.1fs", time.time() - t0)
+        except Exception as e:
+            PIPE = None
+            STATE["load"] = "error"
+            STATE["error"] = f"重建管线失败: {type(e).__name__}: {e}"
+            log.exception("重建管线失败")
+            raise
+
+
+def _call_pipeline(pipe, kwargs: dict):
+    """调管线, 并识别「offload 状态损坏」。
+
+    这种错误看起来像普通的设备不匹配异常, 但含义完全不同: 管线已经不能用了,
+    继续重试多少次都一样, 必须重建。识别出来就抛 OffloadPoison, 由调用方决定
+    是重建后重试(同步接口)还是记为可重试的失败(队列)。
+    """
+    try:
+        return pipe(**kwargs)
+    except RuntimeError as e:
+        if _is_offload_poison(e):
+            raise OffloadPoison(str(e)[:200]) from e
+        raise
+
+
+class OffloadPoison(RuntimeError):
+    """模型 offload 状态已损坏, 需重建管线(区别于普通 OOM)。"""
+
+
 # ---------------------------------------------------------------- 请求归一化
 class ParamError(ValueError):
     """请求参数不合法(HTTP 400 / 任务失败原因)。"""
 
 
+def _has_prompt(payload: dict) -> bool:
+    """请求里是否带了至少一条非空提示词(单条 ``prompt`` 或批量 ``prompts``)。
+
+    网页的「新建任务」永远发的是 ``prompts`` 数组(splitPrompts), 顶层 ``prompt``
+    只在直接调 API 时才有, 所以校验必须两个都认, 否则网页一上传参考图就 400。
+    """
+    p = payload.get("prompt")
+    if isinstance(p, str) and p.strip():
+        return True
+    ps = payload.get("prompts")
+    if isinstance(ps, str):
+        return bool(ps.strip())
+    if isinstance(ps, list):
+        return any(str(x).strip() for x in ps)
+    return False
+
+
+def _check_response_format(value) -> str:
+    """校验并归一化 response_format。入队请求也走这里, 免得非法值被静默吞掉。"""
+    fmt = str(value or "url").lower()
+    if fmt not in ("url", "b64_json"):
+        raise ParamError(f"response_format 需为 'url' 或 'b64_json'，收到: {value!r}")
+    return fmt
+
+
 def _plan_size(payload: dict, images) -> tuple:
     """解析 (w, h, capped, ref_index_used)；编辑模式画布跟随 ref_index 那张。"""
+    kw = dict(size=payload.get("size"), aspect_ratio=payload.get("aspect_ratio"),
+              long_side=payload.get("long_side"), width=payload.get("width"),
+              height=payload.get("height"))
     try:
-        w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
-                                    payload.get("long_side"))
+        w, h, capped = resolve_size(**kw)
         ref_index_used = None
         if images:
             ref_index_used, ref_img = pick_ref_image(images, payload.get("ref_index"))
-            w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
-                                        payload.get("long_side"),
-                                        ref_wh=(ref_img.width, ref_img.height))
+            w, h, capped = resolve_size(ref_wh=(ref_img.width, ref_img.height), **kw)
     except ValueError as e:
         raise ParamError(str(e))
     return w, h, capped, ref_index_used
@@ -431,6 +563,11 @@ def _ref_warnings(images, ref_index_used: int) -> list:
                 f"(第 {len(images)} 张) 推导；差异较大时条件图可能变形，"
                 f"建议统一参考图比例或用 ref_index=-1 对齐"]
     return []
+
+
+def _random_seed() -> int:
+    """随机种子(未指定 seed 时用)。"""
+    return int.from_bytes(os.urandom(4), "big")
 
 
 def _build_plan(payload: dict, images, base_url: str = "") -> dict:
@@ -492,7 +629,12 @@ def _build_plan(payload: dict, images, base_url: str = "") -> dict:
         warnings += _ref_warnings(images, ref_index_used)
 
     seed = payload.get("seed")
-    seed = int(seed) if seed not in (None, "") else int.from_bytes(os.urandom(4), "big")
+    seed = int(seed) if seed not in (None, "") else _random_seed()
+
+    # 响应格式: OpenAI 风格的 "url"(默认) 或 "b64_json"。队列任务一律按 url 处理
+    # (网页要的是可访问的链接, 也便于落盘后继续编辑), 所以入队时它会被剥掉 ——
+    # 校验因此必须在这里之前做完, 否则入队请求会把这个非法值静默吞掉。
+    response_format = _check_response_format(payload.get("response_format"))
 
     return {
         "prompt": prompt,
@@ -503,9 +645,12 @@ def _build_plan(payload: dict, images, base_url: str = "") -> dict:
         "seed": seed,
         "width": w,
         "height": h,
+        # 把实际画布也记下来: PATCH/「重新生成」时才能原样复用(不然自定义尺寸会丢)
+        "size": f"{w}x{h}",
         "capped": capped,
         "output_resolution": output_resolution,
         "transparent": bool(payload.get("transparent", False)),
+        "response_format": response_format,
         "ref_index": ref_index_used,
         "base_url": base_url,
         "warnings": warnings,
@@ -573,15 +718,21 @@ def api_info():
         "endpoints": {
             "POST /v1/images/generations": "文生图 (OpenAI 风格); queue=true 或 prompts=[...] 时改为入队异步生成",
             "POST /v1/images/edits": "图片编辑 / 多参考图 (JSON + base64, 最多 10 张)",
-            "POST /v1/images/edits/json": "同上, images 亦可为本站 /outputs/ 图片路径",
+            "POST /v1/images/edits/json": "同上, images 亦可为 data URL 或本站 /outputs/ 图片路径; 支持 queue=true / prompts=[...] 批量入队",
             "GET /v1/models": "模型列表",
             "GET /health": "健康检查 / 显存 / 加载状态 / 队列计数",
             "GET /api/queue": "任务队列概览与参数上限",
-            "GET /api/tasks": "任务列表 (status / limit 过滤)",
+            "GET /api/tasks": "任务列表 (status / limit / with_outputs 过滤)",
             "GET /api/tasks/{id}": "单条任务详情",
+            "GET /api/tasks/{id}/refs/{name}": "取回任务的参考图",
             "PATCH /api/tasks/{id}": "编辑未开始任务的提示词与参数",
             "POST /api/tasks/{id}/cancel": "取消任务(未开始立即取消, 运行中到采样步边界生效)",
             "POST /api/tasks/{id}/retry": "按原参数重新生成(新建一条任务)",
+            "POST /api/tasks/{id}/release": "开始单条暂存任务",
+            "POST /api/tasks/{id}/hold": "把尚未开始的任务退回暂存",
+            "POST /api/queue/release-all": "开始全部暂存任务",
+            "POST /api/queue/auto-start": "开关「加入后自动生成」",
+            "POST /api/queue/delete": "批量删除任务及其产物",
             "DELETE /api/tasks/{id}": "删除任务及其产物",
             "GET /": "Web 使用页面",
         },
@@ -591,6 +742,7 @@ def api_info():
             "output_resolution": "参考图缩放基准, 不传则跟随出图长边",
             "ref_index": "多参考图时按第几张定画布长宽比, 默认 0, -1 为最后一张",
             "queue": "任务落盘于 outputs/tasks/tasks.json, 重启后仍在; 未开始的任务可取消/编辑/删除",
+            "response_format": "同步接口可传 'url'(默认) 或 'b64_json'; 入队任务一律返回 url",
         },
         "docs": "/docs",
     }
@@ -620,6 +772,8 @@ def health():
         "ref_index": REF_IMAGE_INDEX,
         "queue": TASK_STORE.counts(),
         "current_task": current,
+        # offload 状态曾经损坏过(已自动重建); 非 0 表示重建发生的时间戳
+        "offload_recovered_at": OFFLOAD_POISONED["at"] or None,
     }
 
 
@@ -647,10 +801,10 @@ def edits(request: Request, payload: dict):
         raise HTTPException(400, "images 需为 base64 字符串或数组")
     if len(imgs) > MAX_REF_IMAGES:
         raise HTTPException(400, f"最多支持 {MAX_REF_IMAGES} 张参考图")
-    if not payload.get("prompt") or not isinstance(payload.get("prompt"), str):
+    if not _has_prompt(payload):
         raise HTTPException(400, "缺少 prompt 字段")
     if payload.get("prompts"):
-        raise HTTPException(400, "prompts 批量提交只支持文生图 /v1/images/generations")
+        raise HTTPException(400, "prompts 批量提交请用 /v1/images/edits/json")
     try:
         pil_images = [_b64_to_pil(s) for s in imgs]
     except ValueError as e:
@@ -662,7 +816,8 @@ def edits(request: Request, payload: dict):
 def edits_json(request: Request, payload: dict):
     """编辑任务的 JSON 变体: images 可为 base64、data URL 或 /outputs/... 路径。
 
-    与 /v1/images/edits 等价, 但允许直接把已有结果图当参考图(Web 界面「继续编辑」用)。
+    与 /v1/images/edits 等价, 但允许直接把已有结果图当参考图(Web 界面「继续编辑」用),
+    也接受 ``prompts: [...]`` 批量入队 —— 网页「多条提示词 + 参考图」走的就是这条。
     """
     imgs = payload.get("images", payload.get("image"))
     if imgs is None:
@@ -673,8 +828,9 @@ def edits_json(request: Request, payload: dict):
         raise HTTPException(400, "images 需为字符串或数组")
     if len(imgs) > MAX_REF_IMAGES:
         raise HTTPException(400, f"最多支持 {MAX_REF_IMAGES} 张参考图")
-    if not payload.get("prompt") or not isinstance(payload.get("prompt"), str):
-        raise HTTPException(400, "缺少 prompt 字段")
+    # 注意: 判空必须同时认 prompt 与 prompts —— 网页只发 prompts(数组), 从不发 prompt。
+    if not _has_prompt(payload):
+        raise HTTPException(400, "缺少 prompt 字段 (或 prompts 数组)")
     try:
         pil_images = [_ref_source_to_pil(s) for s in imgs]
     except ValueError as e:
@@ -723,7 +879,13 @@ def run_generation(plan: dict, images, progress=None) -> dict:
     w, h = int(plan["width"]), int(plan["height"])
     steps = int(plan["steps"])
     n = int(plan["n"])
-    seed = int(plan["seed"])
+    seed = plan.get("seed")
+    if seed in (None, ""):
+        # 兜底: 老版本「重新生成」会把 seed 从计划里删掉(执行时 KeyError('seed'))。
+        # 这类任务已经落在 tasks.json 里了, 这里补一颗随机种子让它还能正常跑完。
+        seed = _random_seed()
+        log.warning("任务计划缺少 seed, 已补随机种子 %d", seed)
+    seed = int(seed)
     true_cfg = float(plan["true_cfg_scale"])
     output_resolution = int(plan["output_resolution"])
     negative = plan.get("negative_prompt")
@@ -731,6 +893,8 @@ def run_generation(plan: dict, images, progress=None) -> dict:
     real_prompt = _wrap_transparency(plan["prompt"], bool(plan.get("transparent")))
     warnings = list(plan.get("warnings") or [])
     capped = bool(plan.get("capped"))
+    # 老任务(落盘时还没有这个键)也走默认值
+    response_format = str(plan.get("response_format") or "url").lower()
 
     step_cb = _make_step_callback(progress)
     STATE["waiting"] += 1
@@ -770,38 +934,62 @@ def run_generation(plan: dict, images, progress=None) -> dict:
                     kwargs["image"] = images[0] if len(images) == 1 else images
                 kwargs = _pipeline_kwargs(kwargs)
                 try:
-                    image = pipe(**kwargs).images[0]
+                    image = _call_pipeline(pipe, kwargs).images[0]
+                except OffloadPoison as poison:
+                    # offload 状态被搞坏: 重建管线后原样重试一次。
+                    # 用户不需要重启服务, 队列和历史结果都不受影响。
+                    OFFLOAD_POISONED["at"] = time.time()
+                    OFFLOAD_POISONED["err"] = str(poison)
+                    _recover_pipeline(str(poison))
+                    pipe = PIPE
+                    warnings.append("检测到显存搬运状态异常, 已自动重建模型并重试本次生成")
+                    image = _call_pipeline(pipe, kwargs).images[0]
                 except RuntimeError as e:
                     # OutOfMemoryError 是 RuntimeError 子类; 权重搬移等路径的 OOM
                     # 以泛 RuntimeError 抛出(仅按消息识别, 其他 RuntimeError 照常上抛)
                     if "out of memory" not in str(e).lower():
                         raise
                     _oom_reset()
-                    # 长边 > 1024 时自动降级重试一次
-                    if max(w, h) > 1024:
-                        scale = 1024 / max(w, h)
-                        w2, h2 = _round16(w * scale), _round16(h * scale)
-                        log.warning("OOM，自动降级重试 %dx%d", w2, h2)
-                        kwargs["width"], kwargs["height"] = w2, h2
-                        # 参考图缩放基准同步降级, 否则条件图仍按原尺寸上卡
-                        new_res = _clamp_output_resolution(min(output_resolution, max(w2, h2)))
-                        if new_res != output_resolution:
-                            output_resolution = new_res
-                            kwargs["output_resolution"] = new_res
-                            warnings.append(
-                                f"OOM 降级重试：output_resolution 同步降至 {new_res}")
-                        if TILING_MODE not in ("1", "on", "true", "always",
-                                                "0", "off", "false", "never"):
-                            pipe.vae.use_tiling = bool(images) or max(w2, h2) > 1024
-                        image = pipe(**kwargs).images[0]
-                        w, h = w2, h2
-                        capped = True
-                    else:
-                        raise HTTPException(
-                            413, "显存不足(OOM)。请降低 size/steps，或设置 "
-                                 "QWEN_MAX_SIDE=1024、QWEN_OFFLOAD=sequential 后重启")
+                    # OOM 也可能已经把 offload 状态搞坏 —— 先探一下, 别把中毒的
+                    # 管线留着给后面的请求(那会导致「一次 OOM, 全服务报废」)。
+                    recovered = False
+                    try:
+                        image = _call_pipeline(pipe, kwargs).images[0]
+                    except OffloadPoison as poison:
+                        OFFLOAD_POISONED["at"] = time.time()
+                        OFFLOAD_POISONED["err"] = str(poison)
+                        _recover_pipeline(f"OOM 之后 offload 状态异常: {poison}")
+                        pipe = PIPE
+                        warnings.append("OOM 后模型状态异常, 已自动重建模型并重试本次生成")
+                        image = _call_pipeline(pipe, kwargs).images[0]
+                        recovered = True
+                    if not recovered:
+                        if max(w, h) > 1024:
+                            scale = 1024 / max(w, h)
+                            w2, h2 = _round16(w * scale), _round16(h * scale)
+                            log.warning("OOM，自动降级重试 %dx%d", w2, h2)
+                            kwargs["width"], kwargs["height"] = w2, h2
+                            # 参考图缩放基准同步降级, 否则条件图仍按原尺寸上卡
+                            new_res = _clamp_output_resolution(
+                                min(output_resolution, max(w2, h2)))
+                            if new_res != output_resolution:
+                                output_resolution = new_res
+                                kwargs["output_resolution"] = new_res
+                                warnings.append(
+                                    f"OOM 降级重试：output_resolution 同步降至 {new_res}")
+                            if TILING_MODE not in ("1", "on", "true", "always",
+                                                    "0", "off", "false", "never"):
+                                pipe.vae.use_tiling = bool(images) or max(w2, h2) > 1024
+                            image = _call_pipeline(pipe, kwargs).images[0]
+                            w, h = w2, h2
+                            capped = True
+                        else:
+                            raise HTTPException(
+                                413, "显存不足(OOM)。请降低 size/steps，或设置 "
+                                     "QWEN_MAX_SIDE=1024、QWEN_OFFLOAD=sequential 后重启")
                 meta = {"seed": seed + i, "width": w, "height": h, "steps": steps}
-                items.append(_save_output(image, base_url, meta))
+                items.append(_save_output(image, base_url, meta,
+                                          response_format=response_format))
 
             elapsed = time.time() - t0
             peak = torch.cuda.max_memory_allocated() / 1e6
@@ -995,7 +1183,9 @@ def queue_overview():
     counts = TASK_STORE.counts()
     return {"counts": counts, "current": current, "auto_start": counts["auto_start"],
             "worker": q.status(), "model_load": STATE["load"],
-            "max_side": MAX_SIDE, "default_steps": DEFAULT_STEPS,
+            "max_side": MAX_SIDE, "default_long_side": DEFAULT_LONG_SIDE,
+            "min_side": 256, "side_step": 16,
+            "default_steps": DEFAULT_STEPS,
             "max_steps": MAX_STEPS, "default_true_cfg_scale": DEFAULT_TRUE_CFG_SCALE,
             "max_true_cfg_scale": MAX_TRUE_CFG_SCALE,
             "max_ref_images": MAX_REF_IMAGES, "max_queue_batch": MAX_QUEUE_BATCH,
@@ -1035,6 +1225,8 @@ def task_ref(task_id: str, name: str):
 # 编辑任务时允许改动的字段(参考图不支持替换: 直接新建任务更清晰)
 _EDITABLE_FIELDS = ("n", "steps", "true_cfg_scale", "seed", "size", "aspect_ratio",
                     "long_side", "output_resolution", "transparent")
+# 影响画布尺寸的字段: 一个都没给就沿用原任务画布, 免得"只改提示词"把尺寸换回默认值
+_SIZE_FIELDS = ("size", "aspect_ratio", "long_side", "width", "height")
 
 
 def _replan(cur: dict, payload: dict, images) -> dict:
@@ -1058,12 +1250,23 @@ def _replan(cur: dict, payload: dict, images) -> dict:
         raw["prompt"] = prompt
     if "negative_prompt" in payload:
         raw["negative_prompt"] = payload["negative_prompt"] or None
-    # 改过尺寸类字段就把原 size 丢掉, 否则旧 size 会一直压过新设置
-    if ("size" in payload or "aspect_ratio" in payload or "long_side" in payload
+    # 调用方完全没提尺寸 -> 沿用原任务画布。
+    # 老任务(params 里只有 width/height、没有 size)靠这一步才能原样重跑;
+    # 否则只改一句提示词就会把画布换回默认的 1024 方形。
+    if (not any(k in payload for k in _SIZE_FIELDS)
+            and cur["params"].get("width") and cur["params"].get("height")):
+        raw["size"] = f"{int(cur['params']['width'])}x{int(cur['params']['height'])}"
+    # 尺寸: 显式传 size 就以它为准(与同步接口一致 —— resolve_size 里 size 优先);
+    # 只改「比例类」字段时丢掉旧 size, 否则旧尺寸会一直压过新设置。
+    # 注意别再写成 "size" in payload 也触发 pop: 那会把调用方刚传进来的 size 删掉,
+    # 静默退回长宽比 —— 网页上的「自定义分辨率」就是这么失效的。
+    if ("aspect_ratio" in payload or "long_side" in payload
             or "width" in payload or "height" in payload):
         raw.pop("size", None)
-        if payload.get("width") and payload.get("height"):
-            raw["size"] = f"{int(payload['width'])}x{int(payload['height'])}"
+    if payload.get("size"):
+        raw["size"] = str(payload["size"])
+    elif payload.get("width") and payload.get("height"):
+        raw["size"] = f"{int(payload['width'])}x{int(payload['height'])}"
     if "seed" in payload and payload["seed"] in (None, ""):
         raw.pop("seed", None)
     try:
@@ -1168,9 +1371,10 @@ def task_retry(task_id: str, payload: Optional[dict] = None):
         raise HTTPException(400, "提示词不能为空")
     images = _load_ref_images(old) if old.get("refs") else None
     plan = _replan(old, override, images)
-    if not payload.get("keep_seed"):
-        if payload.get("seed") in (None, ""):
-            plan.pop("seed", None)          # 未指定就换一批随机种子
+    if not payload.get("keep_seed") and payload.get("seed") in (None, ""):
+        # 「换一批随机种子」= 就地生成一颗新种子。注意不能把 seed 从计划里删掉:
+        # run_generation 要读 plan["seed"], 删了会让任务一执行就 KeyError('seed')。
+        plan["seed"] = _random_seed()
     new = TASK_STORE.create(kind=old["kind"], prompt=plan["prompt"], params=plan,
                             ref_index=plan.get("ref_index"), origin=task_id,
                             source="retry")

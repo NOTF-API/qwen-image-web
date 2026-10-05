@@ -160,6 +160,7 @@ def main():
         check(task["params"]["steps"] == 9, "步数已更新")
         check(task["params"]["width"] == 1024 and task["params"]["height"] == 576,
               f"长宽比已重算 {task['params']['width']}x{task['params']['height']}")
+        orig_seed = task["params"]["seed"]
         status, err = request(port, "PATCH", f"/api/tasks/{tid2}", {"steps": 999})
         check(status == 400, "越界参数被拒绝(400)", err)
         status, task = request(port, "POST", f"/api/tasks/{tid2}/cancel", {})
@@ -183,6 +184,54 @@ def main():
         # 此刻待开始 = 重跑任务 1 条 + 批量 3 条 (前面两条已取消)
         check(len(listing["tasks"]) == 4, f"筛选待开始任务数 4, 实际 {len(listing['tasks'])}")
         check(all(t["status"] == "pending" for t in listing["tasks"]), "筛选结果状态正确")
+
+        print("6b) 重新生成不能再丢 seed(回归: 任务执行时 KeyError('seed'))")
+        # 队列行里的 ↻ 按钮就是 POST {} —— 不传 keep_seed。旧版本这里把 seed 从计划里删掉,
+        # 任务一进 worker 就抛 KeyError('seed'), 进度列显示红色报错。
+        status, res = request(port, "POST", f"/api/tasks/{tid2}/retry", {})
+        check(status == 200, "重新生成(默认换随机种子)成功", res)
+        check(isinstance(res["params"].get("seed"), int),
+              "新任务计划里一定带 seed(执行时才不会 KeyError)", res["params"].get("seed"))
+        check(res["params"]["seed"] != orig_seed, "默认重新生成换了一颗种子")
+        check((res["params"]["width"], res["params"]["height"]) == (1024, 576),
+              f"重新生成沿用原画布 {res['params']['width']}x{res['params']['height']}")
+
+        print("6c) 自定义分辨率(size / long_side / 单边上限)")
+        status, res = request(port, "POST", "/v1/images/generations",
+                              {"prompt": "自定义尺寸", "size": "1280x720", "steps": 4,
+                               "queue": True})
+        check(status == 200 and res["queued"] == 1, "带 size 的任务入队", res)
+        ctid = res["data"][0]["id"]
+        status, ctask = request(port, "GET", f"/api/tasks/{ctid}")
+        check((ctask["params"]["width"], ctask["params"]["height"]) == (1280, 720),
+              f"size=1280x720 生效 {ctask['params']['width']}x{ctask['params']['height']}")
+        check(ctask["params"].get("size") == "1280x720", "任务参数里记下实际画布")
+        status, ctask = request(port, "PATCH", f"/api/tasks/{ctid}", {"prompt": "只改提示词"})
+        check((ctask["params"]["width"], ctask["params"]["height"]) == (1280, 720),
+              "只改提示词时画布原样保住")
+        status, ctask = request(port, "PATCH", f"/api/tasks/{ctid}", {"size": "768x512"})
+        check((ctask["params"]["width"], ctask["params"]["height"]) == (768, 512),
+              f"PATCH 显式改 size 生效(不再被静默丢掉) "
+              f"{ctask['params']['width']}x{ctask['params']['height']}")
+        status, ctask = request(port, "PATCH", f"/api/tasks/{ctid}",
+                                {"aspect_ratio": "1:1", "long_side": 1024})
+        check((ctask["params"]["width"], ctask["params"]["height"]) == (1024, 1024),
+              "改长宽比后画布重算(旧 size 让位)")
+        status, res = request(port, "POST", "/v1/images/generations",
+                              {"prompt": "超上限", "size": "4096x4096", "steps": 4,
+                               "queue": True})
+        big = request(port, "GET", f"/api/tasks/{res['data'][0]['id']}")[1]
+        check((big["params"]["width"], big["params"]["height"])
+              == (queue["max_side"], queue["max_side"]),
+              f"超过单边上限的 size=4096x4096 被缩到 "
+              f"{big['params']['width']}x{big['params']['height']}"
+              f"(网页会在提交前就拦下并报错)")
+        check(big["params"].get("size") == f"{queue['max_side']}x{queue['max_side']}",
+              "计划里的 size 与实际画布一致")
+        check(all(k in queue for k in ("max_side", "default_long_side", "min_side",
+                                       "side_step")),
+              "队列接口下发分辨率上限/默认长边/最小边/步长(网页据此校验)",
+              {k: queue.get(k) for k in ("max_side", "default_long_side", "min_side", "side_step")})
 
         print("7) 编辑任务(图生图) 参考图落盘")
         data_url, png_bytes = png_b64()

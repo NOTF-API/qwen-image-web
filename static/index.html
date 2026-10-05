@@ -209,6 +209,14 @@
     .warn-note { color: #e6b800; font-size: 10px; line-height: 1.5; margin-top: 4px; }
     .muted-note { color: #586069; font-size: 10px; line-height: 1.55; margin-top: 4px; }
 
+    /* ============ 分辨率(长边 / 自定义宽高) ============ */
+    .pair { display: flex; align-items: center; gap: 5px; }
+    .pair input { min-width: 0; }
+    .pair .pair-x { color: #586069; flex: 0 0 auto; }
+    .res-note { font: 10px monospace; line-height: 1.55; margin-top: 5px; color: #8a949e; }
+    .res-note.warn { color: #e6b800; }
+    .res-note.err { color: #e66; }
+
     #refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 6px; margin-top: 6px; }
     #refs .ref { position: relative; aspect-ratio: 1; border-radius: 5px; overflow: hidden; border: 1px solid #23272e; background: #0c0e11; }
     #refs .ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -239,13 +247,13 @@
 
     .list-header, .task-row {
       display: grid;
-      /* 选择 序号 模式 状态 提示词 参数 结果 进度 ↻ 编辑 开始 × */
-      grid-template-columns: 22px 26px 46px 82px minmax(150px, 1fr) 148px 88px 96px 28px 28px 28px 28px;
+      /* 选择 序号 模式 状态 提示词 参数 结果 进度 下载 ↻ 编辑 开始 × */
+      grid-template-columns: 22px 26px 46px 82px minmax(150px, 1fr) 148px 88px 96px 28px 28px 28px 28px 28px;
       gap: 4px;
       align-items: center;
     }
 
-    .list-header, .list { min-width: 1120px; }
+    .list-header, .list { min-width: 1152px; }
 
     .list-header {
       position: sticky; top: 0; z-index: 2;
@@ -316,8 +324,8 @@
     .st-canceled { color: #8a949e; background: rgba(138, 148, 158, .14); }
 
     .clip-info { min-width: 0; }
-    .clip-title { color: #ececee; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-    .clip-title:hover { color: #b1f4bf; }
+    /* 提示词只是文本: 编辑只走行内 ✎ 按钮, 所以这里不给手型指针, 免得看起来能点 */
+    .clip-title { color: #ececee; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .clip-meta { color: #a4a9af; padding-top: 3px; font-size: 10px; overflow-wrap: anywhere; }
     .clip-error { color: #f09191; }
     .clip-warn { color: #deb777; }
@@ -351,6 +359,8 @@
     .icon-btn.go { color: #72e68a; border-color: #2f5a3a; }
     .icon-btn.go:hover:not(:disabled) { background: #16261b; }
     .icon-btn.del:hover:not(:disabled) { color: #e66; border-color: #5a2828; background: #2b1a1a; }
+    .icon-btn.dl { color: #8fb8f2; border-color: #2a3a52; }
+    .icon-btn.dl:hover:not(:disabled) { background: #16202b; color: #b9d4f7; }
 
     .empty { padding: 70px 20px; text-align: center; color: #adb2b7; font-size: 12px; }
     .empty b { color: #586069; display: block; margin-bottom: 6px; font-size: 13px; }
@@ -473,6 +483,22 @@
             <div class="warn-note" id="stepsWarn" hidden>⚠ 步数过低会出糊图/格子伪影，正式出图建议 ≥20</div>
           </div>
         </div>
+        <div class="field">
+          <label>分辨率</label>
+          <div class="grid-2">
+            <input type="number" id="genLongSide" min="256" step="16" placeholder="长边 px">
+            <div class="pair">
+              <input type="number" id="genWidth" min="256" step="16" placeholder="宽">
+              <span class="pair-x">×</span>
+              <input type="number" id="genHeight" min="256" step="16" placeholder="高">
+            </div>
+          </div>
+          <div class="res-note" id="genResNote"></div>
+          <div class="muted-note">
+            左格「长边」配合上面的长宽比（留空 = 服务端默认长边）；右侧两格都填则按<b>精确宽×高</b>出图，
+            长宽比被忽略。尺寸取整到 16 的倍数，单边超过服务端 QWEN_MAX_SIDE 时直接报错、不提交。
+          </div>
+        </div>
         <div class="grid-2">
           <div class="field">
             <label for="genSeed">Seed（留空随机）</label>
@@ -569,6 +595,7 @@
           <div class="hdr">参数</div>
           <div class="hdr">结果</div>
           <div class="hdr">进度</div>
+          <div class="hdr">下载</div>
           <div class="hdr">↻</div>
           <div class="hdr">编辑</div>
           <div class="hdr">开始</div>
@@ -648,6 +675,21 @@
         </div>
       </div>
       <div class="field">
+        <label>分辨率</label>
+        <div class="grid-2">
+          <input type="number" id="editLongSide" min="256" step="16" placeholder="长边 px">
+          <div class="pair">
+            <input type="number" id="editWidth" min="256" step="16" placeholder="宽">
+            <span class="pair-x">×</span>
+            <input type="number" id="editHeight" min="256" step="16" placeholder="高">
+          </div>
+        </div>
+        <div class="res-note" id="editResNote"></div>
+        <div class="muted-note">
+          右侧两格都填 = 精确宽×高（忽略长宽比）；留空则按长宽比 + 长边重算，单边同样受服务端 QWEN_MAX_SIDE 限制。
+        </div>
+      </div>
+      <div class="field">
         <label style="display:flex;align-items:center;gap:7px;color:#b8bfc6">
           <input type="checkbox" id="editTransparent"> 透明背景 PNG
         </label>
@@ -707,6 +749,7 @@
       selected: new Set(),
       editTaskId: null,
       editFinished: false,
+      editFollowRef: false,
       lastSignature: "",
       busy: false,
     };
@@ -829,6 +872,92 @@
     });
 
     // ============================================================
+    // 分辨率: 长边(配合长宽比) 或 自定义 宽×高
+    // 规则与服务端 resolve_size 保持一致: 16 的倍数、最小 256、单边 ≤ max_side。
+    // max_side / 默认长边由 /api/queue 下发(来自启动时的 QWEN_MAX_SIDE / QWEN_LONG_SIDE),
+    // 网页只读不改 —— 改上限要改环境变量并重启服务。超出上限在这里就拦下来报错,
+    // 不再让服务端"静静缩小"。
+    // ============================================================
+    const RES = { max: 0, min: 256, step: 16, defaultLongSide: 1024, softMax: 1024 };
+
+    const RATIO_WH = {
+      "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "3:2": [3, 2],
+      "2:3": [2, 3], "16:9": [16, 9], "9:16": [9, 16],
+    };
+
+    function roundToStep(value) {
+      return Math.max(RES.min, Math.floor(value / RES.step) * RES.step);
+    }
+
+    function limitText() {
+      return RES.max ? `单边上限 ${RES.max}px（服务端 QWEN_MAX_SIDE）` : "单边上限";
+    }
+
+    function tooLargeError(w, h) {
+      return `画布 ${w}×${h} 超过${limitText()}：请改小，或设 QWEN_MAX_SIDE=${Math.max(w, h)} `
+        + `后重启服务（网页不能运行时改这个上限）`;
+    }
+
+    function speedWarn(w, h) {
+      if (Math.max(w, h) <= RES.softMax) return "";
+      return `超过 ${RES.softMax}px：耗时与显存明显上升（1024²@30步约 98s），`
+        + `显存不足时服务端会自动降一级重试`;
+    }
+
+    /** 解析一组分辨率控件 -> {error}(拦截) 或 {size|long_side, canvas, warn, note} */
+    function readResolution(v) {
+      const rawW = String(v.width == null ? "" : v.width).trim();
+      const rawH = String(v.height == null ? "" : v.height).trim();
+      if (rawW || rawH) {
+        if (!rawW || !rawH) {
+          return { error: "自定义尺寸要同时填「宽」和「高」（不想自定义就都留空）" };
+        }
+        const w0 = Number(rawW), h0 = Number(rawH);
+        if (!Number.isInteger(w0) || !Number.isInteger(h0) || w0 <= 0 || h0 <= 0) {
+          return { error: "宽/高必须是正整数" };
+        }
+        const w = roundToStep(w0), h = roundToStep(h0);
+        if (RES.max && Math.max(w, h) > RES.max) return { error: tooLargeError(w, h) };
+        const notes = [];
+        if (w !== w0 || h !== h0) notes.push(`已按 ${RES.step} 的倍数取整为 ${w}×${h}`);
+        const warn = speedWarn(w, h);
+        if (warn) notes.push(warn);
+        return { size: `${w}x${h}`, canvas: `${w}×${h}`, warn,
+                 note: `画布 ${w}×${h}（自定义）` + (notes.length ? " · " + notes.join(" · ") : "") };
+      }
+      const rawLs = String(v.longSide == null ? "" : v.longSide).trim();
+      const ls0 = rawLs === "" ? RES.defaultLongSide : Number(rawLs);
+      if (!Number.isInteger(ls0) || ls0 <= 0) return { error: "长边必须是正整数" };
+      const ls = roundToStep(ls0);
+      if (RES.max && ls > RES.max) return { error: tooLargeError(ls, ls) };
+      const wh = RATIO_WH[v.ratio];
+      if (!wh) {
+        const text = v.followRef ? `跟随参考图比例（长边 ${ls}px）` : `画布 ${ls}×${ls}（正方形）`;
+        const warn = speedWarn(ls, ls);
+        return { long_side: ls, canvas: v.followRef ? `长边 ${ls}` : `${ls}×${ls}`, warn,
+                 note: text + (warn ? " · " + warn : "") };
+      }
+      const [a, b] = wh;
+      const w = roundToStep(a >= b ? ls : Math.round(ls * a / b));
+      const h = roundToStep(a >= b ? Math.round(ls * b / a) : ls);
+      const warn = speedWarn(w, h);
+      return { long_side: ls, canvas: `${w}×${h}`, warn,
+               note: `画布 ${w}×${h}（长边 ${ls}px）` + (warn ? " · " + warn : "") };
+    }
+
+    /** 把解析结果画到提示行上, 并把结果返回给调用方 */
+    function paintResNote(el, res) {
+      if (res.error) {
+        el.className = "res-note err";
+        el.textContent = "✕ " + res.error;
+      } else {
+        el.className = "res-note" + (res.warn ? " warn" : "");
+        el.textContent = (res.warn ? "⚠ " : "") + res.note;
+      }
+      return res;
+    }
+
+    // ============================================================
     // 新建任务
     // ============================================================
     function splitPrompts() {
@@ -846,6 +975,36 @@
     function updateSteps() {
       $("stepsVal").textContent = $("genSteps").value;
       $("stepsWarn").hidden = +$("genSteps").value >= 20;
+    }
+
+    // ---- 新建任务的分辨率控件 ----
+    function genResolution() {
+      return readResolution({
+        ratio: $("genRatio").value,
+        longSide: $("genLongSide").value,
+        width: $("genWidth").value,
+        height: $("genHeight").value,
+        followRef: refFiles.length > 0,
+      });
+    }
+
+    function renderGenResNote() {
+      return paintResNote($("genResNote"), genResolution());
+    }
+
+    function applyResLimits() {
+      // 上限来自服务端, 只用来校验与提示: 把 number 框的上下限与占位符对齐
+      for (const id of ["genLongSide", "genWidth", "genHeight", "editLongSide",
+                        "editWidth", "editHeight"]) {
+        const el = $(id);
+        el.min = String(RES.min);
+        el.step = String(RES.step);
+        if (RES.max) el.max = String(RES.max);
+      }
+      $("genLongSide").placeholder = "长边 px";
+      $("editLongSide").placeholder = "长边 px";
+      renderGenResNote();
+      renderEditResNote();
     }
 
     function updateAutoGenerate() {
@@ -897,14 +1056,24 @@
         $("genPrompt").focus();
         return;
       }
+      const res = renderGenResNote();
+      if (res.error) {                       // 尺寸不合法(含超过单边上限): 直接拦下
+        setGenStatus("分辨率不合适：" + res.error, "err");
+        return;
+      }
       const body = {
         prompts,
         queue: true,
         steps: +$("genSteps").value,
         n: +$("genN").value,
       };
-      const ratio = $("genRatio").value;
-      if (ratio) body.aspect_ratio = ratio;
+      // 自定义宽高走 size; 否则用「长宽比 + 长边」, 长边留空时交给服务端默认值
+      if (res.size) body.size = res.size;
+      else {
+        const ratio = $("genRatio").value;
+        if (ratio) body.aspect_ratio = ratio;
+        if (res.long_side) body.long_side = res.long_side;
+      }
       const negative = $("genNegative").value.trim();
       if (negative) body.negative_prompt = negative;
       const cfg = +$("genCfg").value;
@@ -957,6 +1126,14 @@
         }
         return true;
       });
+    }
+
+    // 固定顺序: 按任务号降序(最新的在最上面)。
+    // 服务端返回的顺序是「未结束在前(按提交顺序) + 已结束在后(按结束时间倒序)」,
+    // 直接用的话任务一取消/完成就会换位置(重新生成同理), 所以这里按任务号重排一次,
+    // 与状态、结束时间都无关 —— 行只会因为「新增了任务」而下移, 不会自己跳。
+    function sortTasks(tasks) {
+      return tasks.slice().sort((a, b) => (b.seq || 0) - (a.seq || 0));
     }
 
     function paramsLine(task) {
@@ -1019,6 +1196,43 @@
       return `<div class="outputs">${thumbs}${more}</div>`;
     }
 
+    /** 产物文件名: 取 URL 最后一段(与服务端 /outputs/xxx.png 命名一致) */
+    function outputFilename(item, index) {
+      const name = String((item && item.url) || "").split("/").pop();
+      return name || `qwen-image-${index + 1}.png`;
+    }
+
+    /** 用隐藏的 <a download> 触发一次下载(同源 /outputs/... 才会把文件名带下去) */
+    function saveOutput(item, index) {
+      const link = document.createElement("a");
+      link.href = item.url;
+      link.download = outputFilename(item, index);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }
+
+    // 多张产物之间隔开一点再发下一次下载: 同一瞬间连点多个下载, 浏览器会当成
+    // "自动下载多个文件" 而拦下来; 第一张仍然在点击手势里直接下, 不会被拦。
+    const DOWNLOAD_GAP_MS = 250;
+
+    /** 列表里的 ↓: 一条任务的产物一次下完 */
+    function downloadTaskOutputs(taskId) {
+      const task = state.tasks.find((t) => t.id === taskId);
+      const outputs = task ? (task.outputs || []) : [];
+      if (!outputs.length) {
+        setStatus("这条任务还没有可下载的图片", "err");
+        return;
+      }
+      outputs.forEach((item, index) => {
+        if (index === 0) saveOutput(item, index);
+        else setTimeout(() => saveOutput(item, index), index * DOWNLOAD_GAP_MS);
+      });
+      setStatus(outputs.length > 1
+        ? `开始下载 #${task.seq} 的 ${outputs.length} 张图片（浏览器可能询问是否允许下载多个文件）`
+        : `开始下载 #${task.seq} 的图片`, "ok");
+    }
+
     function statusBadge(task) {
       const key = task.staged ? "staged" : task.status;
       return `<span class="badge-status st-${esc(key)}">${esc(STATUS_LABEL[task.status] || task.status)}</span>`;
@@ -1026,10 +1240,17 @@
 
     function rowActions(task) {
       const busy = task.status === "running" || task.status === "canceling";
+      const count = (task.outputs || []).length;
+      const download = `<button class="icon-btn dl" data-act="download" data-id="${task.id}"`
+        + `${count ? "" : " disabled"} title="${count
+          ? (count > 1 ? `下载这条任务的全部 ${count} 张图片` : "下载这张图片")
+          : "还没有可下载的图片"}">↓</button>`;
       const retry = `<button class="icon-btn regen" data-act="retry" data-id="${task.id}" `
         + `title="重新生成（新建一条任务，保留本次结果）">↻</button>`;
-      const edit = `<button class="icon-btn" data-act="edit" data-id="${task.id}" `
-        + `title="${task.status === "pending" ? "编辑提示词与参数" : "改提示词后重新生成"}">✎</button>`;
+      // 生成中的任务不能编辑(要改先取消): 直接置灰, 免得点了没反应像是按钮坏了
+      const edit = `<button class="icon-btn" data-act="edit" data-id="${task.id}"${busy ? " disabled" : ""} `
+        + `title="${busy ? "任务生成中：先取消再编辑"
+          : task.status === "pending" ? "编辑提示词与参数" : "改提示词后重新生成"}">✎</button>`;
       const start = task.status === "pending"
         ? (task.staged
           ? `<button class="icon-btn go" data-act="release" data-id="${task.id}" title="开始这条暂存任务">▶</button>`
@@ -1040,7 +1261,7 @@
         : (task.status === "pending"
           ? `<button class="icon-btn del" data-act="cancel" data-id="${task.id}" title="取消这条未开始的任务">■</button>`
           : `<button class="icon-btn del" data-act="delete" data-id="${task.id}" title="删除任务及其图片">×</button>`);
-      return { retry, edit, start, cancel };
+      return { download, retry, edit, start, cancel };
     }
 
     function rowHTML(task) {
@@ -1070,6 +1291,7 @@
         <div class="clip-meta">${esc(paramsLine(task))}</div>
         <div class="cell">${outputsCell(task)}</div>
         <div class="cell">${progressCell(task)}</div>
+        <div class="cell center">${actions.download}</div>
         <div class="cell center">${actions.retry}</div>
         <div class="cell center">${actions.edit}</div>
         <div class="cell center">${actions.start}</div>
@@ -1139,7 +1361,7 @@
     async function refreshTasks(force) {
       try {
         const data = await api("/api/tasks");
-        state.tasks = data.tasks || [];
+        state.tasks = sortTasks(data.tasks || []);
         state.counts = data.counts || {};
         const signature = signatureOf(state.tasks);
         if (force || signature !== state.lastSignature) {
@@ -1159,6 +1381,11 @@
     // 行内操作
     // ============================================================
     async function taskAction(taskId, action) {
+      // 「编辑」是纯前端弹窗, 不进 busy 流程: 早退以免碰上轮询刷新期间被 busy 吃掉点击
+      if (action === "edit") {
+        openEditor(taskId);
+        return;
+      }
       if (state.busy) return;
       state.busy = true;
       try {
@@ -1188,7 +1415,8 @@
     }
 
     $("list").addEventListener("click", (event) => {
-      // 复选框与行内按钮各自处理, 不再冒泡到"点整行打开编辑弹窗"
+      // 行内只有三处可点: 最左的复选框、右侧几个操作按钮、结果缩览图。
+      // 其余任何位置(提示词文本、参数、进度、占位符、空白)都是无操作 —— 编辑只挂在 ✎ 按钮上。
       const pick = event.target.closest(".pick");
       if (pick) {
         if (pick.checked) state.selected.add(pick.dataset.id);
@@ -1198,36 +1426,22 @@
       }
       const button = event.target.closest("button[data-act]");
       if (button) {
-        taskAction(button.dataset.id, button.dataset.act);
+        // 「编辑」「下载」都是纯前端动作, 直接做: 不进 taskAction 的 busy 流程,
+        // 免得轮询刷新期间被吃掉
+        const act = button.dataset.act;
+        if (act === "edit") openEditor(button.dataset.id);
+        else if (act === "download") downloadTaskOutputs(button.dataset.id);
+        else taskAction(button.dataset.id, act);
         return;
       }
-      // 结果缩览图: 点在图上就在本页打开图片查看器(不弹编辑窗, 也不跳新标签页)
+      // 结果缩览图: 点在图上就在本页打开图片查看器(不跳新标签页)
       const thumb = event.target.closest("a[data-view]");
       if (thumb) {
         event.preventDefault();
         openViewer(thumb.dataset.view, +thumb.dataset.index || 0);
         return;
       }
-      // 结果链接/其它链接: 只走链接自身行为, 不弹编辑窗
-      if (event.target.closest("a")) return;
-      // 其它表单控件同理
-      if (event.target.closest("input, select, textarea, label, summary")) return;
-      const row = event.target.closest(".task-row");
-      if (row) openEditor(row.dataset.id);
-    });
-
-    // 缩览图: 阻止任何冒泡与默认之外的副作用, 并给出去向提示
-    $("list").addEventListener("auxclick", (event) => {
-      if (event.target.closest("a")) event.stopPropagation();
-    });
-    $("list").addEventListener("mousedown", (event) => {
-      if (event.button !== 0) event.stopPropagation();
-    });
-    $("list").addEventListener("keydown", (event) => {
-      // 结果链接上按回车/空格只走链接自身行为
-      if (event.target.closest("a") && (event.key === "Enter" || event.key === " ")) {
-        event.stopPropagation();
-      }
+      // 到底了: 不做事
     });
 
     $("selectAll").addEventListener("change", (event) => {
@@ -1278,7 +1492,7 @@
       $("viewerImage").alt = `生成结果第 ${viewer.index + 1} 张`;
       $("viewerOpen").href = item.url;
       $("viewerDownload").href = item.url;
-      const filename = String(item.url).split("/").pop() || "qwen-image.png";
+      const filename = outputFilename(item, viewer.index);
       $("viewerDownload").setAttribute("download", filename);
       $("viewerCount").textContent = `${viewer.index + 1} / ${outputs.length}`;
       $("viewerMeta").textContent =
@@ -1331,11 +1545,7 @@
       viewer.index = +img.dataset.index;
       renderViewer();
     });
-    // 点查看器背景(图片之外)关闭
-    $("viewer").addEventListener("click", (event) => {
-      if (event.target === $("viewer")) closeViewer();
-    });
-    // 查看器打开时: ← → 切换, Esc 交给 <dialog> 原生关闭
+    // 查看器打开时: ← → 切换图片(关闭走「关闭」按钮 / 点遮罩 / Esc, 见下面的通用绑定)
     document.addEventListener("keydown", (event) => {
       const dialog = $("viewer");
       if (!dialog.open) return;
@@ -1347,6 +1557,43 @@
         stepViewer(1);
       }
     });
+
+    // ============================================================
+    // 弹窗关闭: 点遮罩(背景) 与 Esc 都必须能关
+    // 两个弹窗共用这一套绑定 —— 少写一处就会出现"这个窗点遮罩关不掉、按 Esc 也没反应"
+    // ============================================================
+    /** 点遮罩关闭: 只有点击落在 <dialog> 自己身上(而不是里面的表单/控件)才算点在遮罩上 */
+    function bindBackdropClose(dialog, onClose) {
+      dialog.addEventListener("click", (event) => {
+        if (event.target === dialog) onClose();
+      });
+    }
+
+    /**
+     * Esc 关闭: <dialog> 本来就有原生 Esc, 但部分环境(输入法组词、内嵌浏览器)会把它吞掉,
+     * 表现为"按 Esc 什么都不发生", 所以这里再显式兜底一次。
+     */
+    function bindEscapeClose(dialog, onClose) {
+      document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape" && event.key !== "Esc") return;   // 老浏览器 key 是 "Esc"
+        // 输入法组词中的 Esc 是"取消候选", 不该顺手把窗口关掉
+        if (!dialog.open || event.isComposing || event.keyCode === 229) return;
+        onClose();
+      });
+    }
+
+    function closeEditor() {
+      const dialog = $("editDialog");
+      if (dialog.open) dialog.close();      // 触发 close 事件, 由它清 state.editTaskId
+      else state.editTaskId = null;
+    }
+
+    // 编辑态一律挂在 close 事件上清理: 不管从哪条路关(取消/保存/遮罩/Esc)都不会留脏状态
+    $("editDialog").addEventListener("close", () => { state.editTaskId = null; });
+    bindBackdropClose($("viewer"), closeViewer);
+    bindEscapeClose($("viewer"), closeViewer);
+    bindBackdropClose($("editDialog"), closeEditor);
+    bindEscapeClose($("editDialog"), closeEditor);
 
     // ============================================================
     // 编辑弹窗
@@ -1371,7 +1618,16 @@
       $("editNegative").value = task.negative_prompt || "";
       $("editSteps").value = p.steps || 30;
       $("editCfg").value = p.true_cfg_scale || 1;
-      $("editRatio").value = ratioOf(p);
+      const ratio = ratioOf(p);
+      $("editRatio").value = ratio;
+      // 原画布对不上任何预设比例(例如上一版设过自定义尺寸)时, 用「自定义宽高」原样填回去,
+      // 这样只改提示词也不会把尺寸悄悄换掉。
+      const custom = !ratio && p.width && p.height;
+      $("editWidth").value = custom ? p.width : "";
+      $("editHeight").value = custom ? p.height : "";
+      $("editLongSide").value = Math.max(p.width || 0, p.height || 0) || RES.defaultLongSide;
+      state.editFollowRef = !ratio && !custom && !!(task.refs && task.refs.length);
+      renderEditResNote();
       $("editN").value = p.n || 1;
       $("editSeed").value = p.seed != null ? p.seed : "";
       $("editOutputRes").value = p.output_resolution || "";
@@ -1382,22 +1638,36 @@
       $("editRefs").innerHTML = (task.refs || []).map((name) =>
         `<img src="/api/tasks/${task.id}/refs/${encodeURIComponent(name)}" alt="${esc(name)}">`).join("");
       $("editStatus").textContent = "";
-      $("editDialog").showModal();
+      // 双击 ✎ 会让第二次 showModal() 抛 InvalidStateError(窗已经开着), 这里先判一下
+      if (!$("editDialog").open) $("editDialog").showModal();
       $("editPrompt").focus();
     }
 
     function ratioOf(params) {
-      const ratio = { "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "3:2": [3, 2],
-        "2:3": [2, 3], "16:9": [16, 9], "9:16": [9, 16] };
-      if (params.aspect_ratio && ratio[params.aspect_ratio]) return params.aspect_ratio;
+      if (params.aspect_ratio && RATIO_WH[params.aspect_ratio]) return params.aspect_ratio;
       if (params.width && params.height) {
         const value = params.width / params.height;
-        for (const key of Object.keys(ratio)) {
-          const [a, b] = ratio[key];
+        for (const key of Object.keys(RATIO_WH)) {
+          const [a, b] = RATIO_WH[key];
           if (Math.abs(value - a / b) < 0.02) return key;
         }
       }
       return "";
+    }
+
+    // ---- 编辑弹窗的分辨率控件(与新建任务同一套解析/校验) ----
+    function editResolution() {
+      return readResolution({
+        ratio: $("editRatio").value,
+        longSide: $("editLongSide").value,
+        width: $("editWidth").value,
+        height: $("editHeight").value,
+        followRef: !!state.editFollowRef,
+      });
+    }
+
+    function renderEditResNote() {
+      return paintResNote($("editResNote"), editResolution());
     }
 
     async function saveEditor() {
@@ -1409,15 +1679,25 @@
         $("editStatus").className = "gen-status err";
         return;
       }
+      const res = renderEditResNote();
+      if (res.error) {
+        $("editStatus").textContent = "分辨率不合适：" + res.error;
+        $("editStatus").className = "gen-status err";
+        return;
+      }
       const payload = {
         prompt,
         negative_prompt: $("editNegative").value.trim() || null,
         steps: +$("editSteps").value,
         true_cfg_scale: +$("editCfg").value,
-        aspect_ratio: $("editRatio").value,
         n: +$("editN").value,
         transparent: $("editTransparent").checked,
       };
+      if (res.size) payload.size = res.size;
+      else {
+        payload.aspect_ratio = $("editRatio").value;
+        if (res.long_side) payload.long_side = res.long_side;
+      }
       const seed = $("editSeed").value;
       const keepSeed = !state.editFinished || $("editKeepSeed").checked;
       if (seed !== "" && keepSeed) payload.seed = +seed;
@@ -1439,8 +1719,7 @@
           });
           setStatus("任务参数已更新", "ok");
         }
-        $("editDialog").close();
-        state.editTaskId = null;
+        closeEditor();
         await refreshTasks(true);
       } catch (error) {
         $("editStatus").textContent = "保存失败：" + error.message;
@@ -1451,10 +1730,7 @@
     }
 
     $("saveEdit").addEventListener("click", saveEditor);
-    $("cancelEdit").addEventListener("click", () => {
-      $("editDialog").close();
-      state.editTaskId = null;
-    });
+    $("cancelEdit").addEventListener("click", closeEditor);
 
     // ============================================================
     // 批量清理
@@ -1541,6 +1817,12 @@
         const data = await api("/api/queue");
         state.autoStart = data.auto_start !== false;
         $("autoGenerate").checked = state.autoStart;
+        // 分辨率上限/默认长边也以服务端为准(启动时的 QWEN_MAX_SIDE / QWEN_LONG_SIDE)
+        if (data.max_side) RES.max = +data.max_side;
+        if (data.default_long_side) RES.defaultLongSide = +data.default_long_side;
+        if (data.min_side) RES.min = +data.min_side;
+        if (data.side_step) RES.step = +data.side_step;
+        applyResLimits();
         updateAutoGenerate();
       } catch (error) { /* 读不到就沿用界面默认 */ }
     }
@@ -1569,7 +1851,24 @@
     });
     $("genCfg").addEventListener("input", updateCfg);
     $("genSteps").addEventListener("input", updateSteps);
-    $("genRatio").addEventListener("change", renderRefs);
+    $("genRatio").addEventListener("change", () => {
+      // 选回预设长宽比就把自定义宽高清掉, 免得两组值打架(自定义优先, 会看着像按钮没反应)
+      $("genWidth").value = "";
+      $("genHeight").value = "";
+      renderRefs();
+      renderGenResNote();
+    });
+    for (const id of ["genLongSide", "genWidth", "genHeight"]) {
+      $(id).addEventListener("input", renderGenResNote);
+    }
+    $("editRatio").addEventListener("change", () => {
+      $("editWidth").value = "";
+      $("editHeight").value = "";
+      renderEditResNote();
+    });
+    for (const id of ["editLongSide", "editWidth", "editHeight"]) {
+      $(id).addEventListener("input", renderEditResNote);
+    }
     $("genPrompt").addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
         event.preventDefault();
@@ -1581,6 +1880,7 @@
     updateSteps();
     updateAutoGenerate();
     renderRefs();
+    applyResLimits();
     setStatus("就绪");
     loadServerPrefs().then(tick);
     setInterval(tick, POLL_MS);
