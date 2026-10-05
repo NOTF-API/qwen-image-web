@@ -48,6 +48,109 @@ def extract_js():
     return fns + "\n" + handler + "\n" + viewer
 
 
+def viewer_head_rules():
+    """按文件顺序取出查看器标题栏相关规则, 用于模拟 flex 收缩。
+
+    返回 [(选择器, 声明 dict, 顺序)], 保留全部命中规则 —— 同一个元素可能被多条
+    规则命中(例如 .viewer-info 与 .viewer-info, .viewer-head .tool-btn), 必须按
+    顺序叠加才是真实层叠结果, 不能只留最后一条。
+    """
+    html = HTML.read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", re.search(r"<style>(.*?)</style>", html, re.S).group(1),
+                 flags=re.S)
+    wanted = {".viewer-head", ".viewer-head .spacer", ".viewer-title", ".viewer-info",
+              ".viewer-head .tool-btn", ".tool-btn"}
+    rules = []
+    for block in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        selectors = block.group(1).split("}")[-1].strip()
+        decls = {}
+        for d in block.group(2).split(";"):
+            if ":" in d:
+                key, value = d.split(":", 1)
+                decls[key.strip()] = value.strip()
+        for sel in (s.strip() for s in selectors.split(",")):
+            if sel in wanted:
+                rules.append((sel, decls, len(rules)))
+    return rules
+
+
+def computed(element_selectors, rules):
+    """把命中该元素的规则按顺序叠加成最终声明。"""
+    out = {}
+    for sel, decls, _order in rules:
+        if sel in element_selectors:
+            out.update(decls)
+    return out
+
+
+def flex_of(decls):
+    """解析 flex 简写, 返回 (grow, shrink, basis)。"""
+    value = decls.get("flex", "0 1 auto").split()
+    grow = float(value[0]) if len(value) > 0 else 0
+    shrink = float(value[1]) if len(value) > 1 else 1
+    basis = value[2] if len(value) > 2 else "auto"
+    return grow, shrink, basis
+
+
+def flex_layout(items, available):
+    """简化版 flex 行布局: 按 flex-grow/shrink 分配宽度, 返回每项最终宽度。
+
+    items: [(名称, 基础宽度, flex 声明 dict)]; available: 容器内容宽度(px)。
+    够用则按 grow 分配剩余空间, 不够则按 shrink 比例收缩(受 min-width 限制)。
+    """
+    bases = [base for _n, base, _d in items]
+    total = sum(bases)
+    free = available - total
+    specs = [flex_of(d) for _n, _b, d in items]
+    if free >= 0:
+        grow_sum = sum(s[0] for s in specs)
+        if grow_sum <= 0:
+            return bases
+        return [b + free * s[0] / grow_sum for b, s in zip(bases, specs)]
+    # 收缩: 权重 = shrink * basis; min-width:0 时下限为 0
+    weights = [s[1] * b for s, b in zip(specs, bases)]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return bases
+    out = []
+    for (name, base, decls), weight in zip(items, weights):
+        floor = 0 if decls.get("min-width") == "0" else base
+        out.append(max(floor, base + free * weight / total_weight))
+    return out
+
+
+def measure_css_layout():
+    """用真实 CSS 值模拟: 很长的提示词下, 标题被省略、按钮不被压扁。"""
+    rules = viewer_head_rules()
+    title = computed({".viewer-title"}, rules)
+    info = computed({".viewer-info", ".viewer-info, .viewer-head .tool-btn"}, rules)
+    button = computed({".tool-btn", ".viewer-head .tool-btn"}, rules)
+    # 按钮基础宽度 = 文本字数 * 11px + 内边距 24px + 边框 2px(粗略但足够判断是否被压扁)
+    def btn_width(text):
+        return len(text) * 11 + 24 + 2
+    buttons = [("原图", btn_width("原图")), ("下载", btn_width("下载")),
+               ("关闭", btn_width("关闭"))]
+    long_prompt = "雨夜霓虹招牌俯瞰街景" * 40
+    title_base = len(f"#11 {long_prompt}") * 12          # 标题字号 12px
+    gap = 10
+    items = ([("标题", title_base, title)]
+             + [("计数", 40, info)]
+             + [(f"{name}按钮", width, button) for name, width in buttons])
+    for width in (1100, 700, 420):                        # 大屏 / 窄窗 / 很窄
+        widths = flex_layout(items, width - gap * (len(items) - 1))
+        title_w = widths[0]
+        button_ws = widths[-3:]
+        # 按钮最终宽度必须不小于各自基础宽度(即没被压扁)
+        squash = [name for (name, base), got in zip(buttons, button_ws) if got < base - 0.5]
+        ok = title_w < title_base and not squash
+        print(f"  [{'ok' if ok else 'FAIL'}] 容器 {width}px: 标题 {title_w:.0f}px"
+              f"(需要 {title_base}px, 会省略) 按钮 {[round(w) for w in button_ws]}"
+              + (f" 被压扁: {squash}" if squash else " 未被压扁"))
+        if not ok:
+            FAILED.append(f"flex 布局在 {width}px 下压扁了按钮")
+    return not FAILED
+
+
 HARNESS = r"""
 // ---- 最小 DOM 模拟 ----
 function makeEl(attrs) {
@@ -115,12 +218,15 @@ const clickHandlers = [];
 
 function makeStub(id) {
   const el = {
-    id, textContent: "", innerHTML: "", src: "", hidden: false, open: false, title: "",
+    id, textContent: "", innerHTML: "", src: "", hidden: false, open: false,
     children: [], attrs: {}, classList: { add() {}, remove() {}, toggle() {} },
     addEventListener(type, fn) { (el._listeners[type] ||= []).push(fn); },
     _listeners: {},
     setAttribute(k, v) { el.attrs[k] = v; if (k === "src") el.src = v; },
     getAttribute(k) { return el.attrs[k]; },
+    // 真实 DOM 里 el.title 与 title 属性是同一份数据, 这里同步, 免得测试看不一致
+    get title() { return el.attrs.title; },
+    set title(v) { el.attrs.title = v; },
     showModal() { el.open = true; },
     // 真实浏览器里 dialog.close() 会派发 close 事件(Esc/按钮关闭同理),
     // 页面正是靠它做清理, 所以这里必须一起派发。
@@ -313,9 +419,18 @@ results.keyboardIgnoredWhenClosed = (() => {
   return $("viewerImage").src === before;
 })();
 
+// 很长的提示词: 标题仍是一行, 完整内容放在 title 属性上供悬停查看
+const longPrompt = "雨夜霓虹招牌俯瞰街景" .repeat(40);
+const longTask = Object.assign({}, doneTask, { id: "T11", seq: 11, prompt: longPrompt });
+state.tasks = [longTask];
+openViewer("T11", 0);
+results.longPromptKeepsTitleTitle = $("viewerTitle").textContent.includes(longPrompt)
+  && $("viewerTitle").getAttribute("title").includes(longPrompt)
+  && $("viewerTitle").getAttribute("title").startsWith("#11");
+closeViewer();
+
 console.log(JSON.stringify(results));
 """
-
 
 def main():
     js_handler = extract_js()
@@ -360,6 +475,30 @@ def main():
         check(res["singleCountText"], "单图任务显示 1/1")
         check(res["keyboardNext"], "← → 键可切换图片")
         check(res["keyboardIgnoredWhenClosed"], "查看器关闭时不响应方向键")
+
+        # ---- 查看器标题栏的 flex 布局(提示词很长时不能把按钮压扁) ----
+        rules = viewer_head_rules()
+        title = computed({".viewer-title"}, rules)
+        info = computed({".viewer-info", ".viewer-info, .viewer-head .tool-btn"}, rules)
+        button = computed({".tool-btn", ".viewer-head .tool-btn"}, rules)
+        check(title.get("text-overflow") == "ellipsis"
+              and title.get("overflow") == "hidden"
+              and title.get("white-space") == "nowrap",
+              "标题过长显示省略号 (overflow/text-overflow/white-space)")
+        _, title_shrink, _ = flex_of(title)
+        check(flex_of(title)[0] >= 1 and title_shrink >= 1,
+              f"标题可伸缩并占满剩余宽度 (flex={title.get('flex')})")
+        check(title.get("min-width") == "0",
+              "标题设置了 min-width:0(否则 flex 项不会收缩, 省略号不生效)")
+        for name, decls in (("原图/下载/关闭按钮", button), ("张数计数", info)):
+            _, shrink, _ = flex_of(decls)
+            check(shrink == 0, f"{name} 不参与收缩 (flex={decls.get('flex')})")
+        check(button.get("padding") and info.get("white-space") == "nowrap",
+              "按钮保留自身内边距/计数不换行")
+        check(res["longPromptKeepsTitleTitle"], "标题 title 属性带完整提示词(悬停显示)")
+
+        print("  -- 标题栏 flex 布局模拟(长提示词) --")
+        measure_css_layout()
         print()
         if FAILED:
             print(f"失败 {len(FAILED)} 项: {FAILED}")

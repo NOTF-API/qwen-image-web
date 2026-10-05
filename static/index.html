@@ -379,9 +379,13 @@
       background: #101318; border: 1px solid #4a4c50; border-radius: 8px;
       color: #ddd; overflow: hidden;
     }
-    .viewer-head { display: flex; align-items: center; gap: 10px; }
-    .viewer-title { font-size: 12px; font-weight: 600; color: #e6ebf0; min-width: 0;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .viewer-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    /* 标题占满剩余宽度并省略: 提示词很长时靠 flex:1 1 auto + min-width:0 触发省略号,
+       不会把右侧「原图 / 下载 / 关闭」压扁; 完整的提示词见 title 属性(悬停显示) */
+    .viewer-title { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600;
+      color: #e6ebf0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* 计数与按钮保持自身宽度, 不参与收缩 */
+    .viewer-info, .viewer-head .tool-btn { flex: 0 0 auto; }
     .viewer-info { font: 10px monospace; color: #8a949e; white-space: nowrap; }
     .viewer-stage { position: relative; display: flex; align-items: center; justify-content: center; min-height: 120px; }
     .viewer-stage img { max-width: 88vw; max-height: 72vh; display: block; object-fit: contain;
@@ -1248,8 +1252,9 @@
       viewer.taskId = taskId;
       viewer.outputs = task.outputs;
       viewer.index = Math.min(Math.max(index || 0, 0), viewer.outputs.length - 1);
+      // 标题一行显示, 过长用省略号; 完整提示词放在 title 上, 悬停即显示
       $("viewerTitle").textContent = `#${task.seq} ${task.prompt}`;
-      $("viewerTitle").title = task.prompt;
+      $("viewerTitle").title = `#${task.seq} 提示词：${task.prompt}`;
       const strip = $("viewerStrip");
       if (viewer.outputs.length > 1) {
         strip.hidden = false;
