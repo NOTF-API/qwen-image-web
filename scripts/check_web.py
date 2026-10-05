@@ -49,6 +49,46 @@ def main():
             print(f"[FAIL] 脚本里没有用到 {path}")
             ok = False
     print("[ok] 关键接口路径均已出现" if ok else "[FAIL] 接口路径缺失")
+
+    # 表格列对齐: grid-template-columns 的列数 == 表头格数 == 行模板产生的格数
+    m = re.search(r"\.list-header,\s*\.task-row\s*\{[^}]*grid-template-columns:\s*"
+                  r"((?:[^;]|\n)+?);", html, re.S)
+    if not m:
+        print("[FAIL] 找不到 .list-header/.task-row 的 grid-template-columns")
+        ok = False
+    else:
+        spec = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+        # 按顶层空白切分: minmax(150px, 1fr) 里的空格不能算成两列
+        toks, depth, buf = [], 0, ""
+        for ch in spec.strip():
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch.isspace() and depth == 0:
+                if buf:
+                    toks.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+        if buf:
+            toks.append(buf)
+        cols = len(toks)
+        header = re.search(r'<div class="list-header">\n(.*?)\n\s*</div>\s*\n\s*<div class="list"',
+                           html, re.S)
+        heads = len(re.findall(r'<div(?: class="[^"]*")?>', header.group(1))) if header else -1
+        row = re.search(r"function rowHTML\(task\) \{(.*?)\n    \}", js, re.S)
+        body = row.group(1) if row else ""
+        tpl = re.search(r'return `<div class="\$\{classes\.join\(" "\)\}"[^>]*>(.*?)</div>`;',
+                        body, re.S)
+        # 模板里每个顶层单元格都顶格缩进 8 空格, 内部元素缩进更多
+        tops = re.findall(r"\n {8}<(div|input)", tpl.group(1)) if tpl else []
+        cells = len(tops)
+        print(f"[{'ok' if cols == heads == cells else 'FAIL'}] 列对齐: "
+              f"grid {cols} 列 / 表头 {heads} 格 / 行 {cells} 格")
+        if not (cols == heads == cells):
+            ok = False
+
     print("语法检查请另行执行: node --check <--dump 出来的文件>")
     return 0 if ok else 1
 

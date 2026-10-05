@@ -239,12 +239,13 @@
 
     .list-header, .task-row {
       display: grid;
-      grid-template-columns: 22px 26px 46px 82px minmax(150px, 1fr) 148px 96px 28px 28px 28px 28px;
+      /* 选择 序号 模式 状态 提示词 参数 结果 进度 ↻ 编辑 开始 × */
+      grid-template-columns: 22px 26px 46px 82px minmax(150px, 1fr) 148px 88px 96px 28px 28px 28px 28px;
       gap: 4px;
       align-items: center;
     }
 
-    .list-header, .list { min-width: 1000px; }
+    .list-header, .list { min-width: 1120px; }
 
     .list-header {
       position: sticky; top: 0; z-index: 2;
@@ -321,10 +322,16 @@
     .clip-error { color: #f09191; }
     .clip-warn { color: #deb777; }
 
-    .outputs { display: flex; gap: 4px; flex-wrap: wrap; }
-    .outputs a { display: block; width: 30px; height: 30px; border: 1px solid #23272e; border-radius: 4px; overflow: hidden; }
+    .outputs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+    .outputs a { display: block; width: 34px; height: 34px; border: 1px solid #23272e; border-radius: 4px; overflow: hidden; }
+    .outputs a:hover { border-color: #72e68a; }
     .outputs img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .outputs .more { font: 10px monospace; color: #8a949e; align-self: center; }
+    .out-placeholder {
+      width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+      border: 1px dashed #262b33; border-radius: 4px; color: #3f464f; font-size: 13px;
+    }
+    .out-note { font: 10px monospace; color: #4a5159; margin-top: 2px; }
 
     .progress-wrap { display: flex; align-items: center; gap: 6px; }
     .progress-bar { flex: 1; height: 5px; background: #1a1d22; border-radius: 3px; overflow: hidden; min-width: 40px; }
@@ -518,8 +525,9 @@
           <div class="hdr">#</div>
           <div class="hdr">模式</div>
           <div class="hdr">状态</div>
-          <div class="hdr left">提示词 / 结果</div>
+          <div class="hdr left">提示词 / 任务</div>
           <div class="hdr">参数</div>
+          <div class="hdr">结果</div>
           <div class="hdr">进度</div>
           <div class="hdr">↻</div>
           <div class="hdr">编辑</div>
@@ -926,15 +934,26 @@
       return `<span class="clip-meta">${pos ? `排队第 ${pos} 位` : "等待中"}</span>`;
     }
 
+    // 结果列: 一列缩览图(点击在新标签页查看原图), 未出图时显示占位符
     function outputsCell(task) {
       const outputs = task.outputs || [];
-      if (!outputs.length) return "";
-      // 点击只打开原图(新标签页); draggable=false 避免拖拽缩览图干扰点击
-      const thumbs = outputs.slice(0, 4).map((item) =>
+      if (!outputs.length) {
+        // 占位符: 未开始 "·", 生成中 "…", 失败 "✕", 已取消 "—"
+        let hint = "·";
+        if (task.status === "running" || task.status === "canceling") hint = "…";
+        else if (task.status === "failed") hint = "✕";
+        else if (task.status === "canceled") hint = "—";
+        const why = task.status === "failed" ? "生成失败，没有图片"
+          : task.status === "canceled" ? "已取消，没有图片"
+          : task.status === "pending" ? "尚未开始生成" : "尚未生成图片";
+        return `<div class="out-placeholder" title="${why}">${hint}</div>`;
+      }
+      const thumbs = outputs.slice(0, 3).map((item) =>
         `<a href="${esc(item.url)}" target="_blank" rel="noreferrer" draggable="false"`
-        + ` title="在新标签页打开原图 ${item.width}×${item.height} seed=${item.seed}">`
-        + `<img src="${esc(item.url)}" loading="lazy" alt="结果" draggable="false"></a>`).join("");
-      const more = outputs.length > 4 ? `<span class="more">+${outputs.length - 4}</span>` : "";
+        + ` title="点击在新标签页查看原图 ${item.width}×${item.height} seed=${item.seed}">`
+        + `<img src="${esc(item.url)}" loading="lazy" alt="生成结果" draggable="false"></a>`).join("");
+      const more = outputs.length > 3
+        ? `<span class="more" title="本次共 ${outputs.length} 张, 这里显示前 3 张">+${outputs.length - 3}</span>` : "";
       return `<div class="outputs">${thumbs}${more}</div>`;
     }
 
@@ -984,10 +1003,10 @@
         <div class="clip-info">
           <span class="clip-title" title="${esc(task.prompt)}">${esc(title)}</span>
           <div class="clip-meta">#${esc(task.id)} · ${esc(fmtTime(task.created_at))}${task.origin ? " · 重跑自 #" + esc(task.origin) : ""}</div>
-          ${outputsCell(task)}
           ${errorLine}${warnLine}
         </div>
         <div class="clip-meta">${esc(paramsLine(task))}</div>
+        <div class="cell">${outputsCell(task)}</div>
         <div class="cell">${progressCell(task)}</div>
         <div class="cell center">${actions.retry}</div>
         <div class="cell center">${actions.edit}</div>

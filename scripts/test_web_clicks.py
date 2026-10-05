@@ -34,10 +34,12 @@ def check(cond, label, extra=""):
 def extract_js():
     html = HTML.read_text(encoding="utf-8")
     js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
-    # 取出 list 的点击处理器那一段(从 $("list").addEventListener("click" 到对应的结尾) )
+    # 渲染用的纯函数段: 从 paramsLine 起(含 statusBadge/rowActions/outputsCell/
+    # progressCell/rowHTML), 到 renderList 前; 再加 list 的点击处理器。
+    fns = js[js.index("function paramsLine"):js.index("function renderList")]
     start = js.index('$("list").addEventListener("click"')
-    end = js.index("$(\"selectAll\").addEventListener")
-    return js[start:end]
+    end = js.index('$("selectAll").addEventListener')
+    return fns + "\n" + js[start:end]
 
 
 HARNESS = r"""
@@ -85,6 +87,16 @@ const state = { selected: new Set() };
 function openEditor(id) { called.openEditor.push(id); }
 function taskAction(id, act) { called.taskAction.push([id, act]); }
 function renderList() { called.renderList++; }
+// rowHTML 依赖的小工具(与页面同语义)
+function esc(text) {
+  return String(text == null ? "" : text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function fmtTime(ts) { return ts ? "12-31 08:00" : ""; }
+function fmtDur(sec) { return sec == null ? "" : sec.toFixed(1) + "s"; }
+const STATUS_LABEL = { pending: "待开始", running: "生成中", canceling: "取消中",
+  done: "已完成", failed: "失败", canceled: "已取消" };
 
 // 行结构: .task-row > [.pick, button[data-act], a > img, .clip-title, .outputs]
 const handlers = [];
@@ -95,23 +107,29 @@ const $ = (id) => (id === "list" ? listEl : {});
 
 __HANDLER__
 
-function buildRow() {
+function buildRow(withOutputs) {
   const row = makeEl({ class: "task-row", dataset: { id: "T1" } });
   const pick = makeEl({ tag: "input", class: "pick", dataset: { id: "T1" } });
   const btn = makeEl({ tag: "button", class: "icon-btn regen", dataset: { act: "retry", id: "T1" } });
   const link = makeEl({ tag: "a", class: "" });
   const img = makeEl({ tag: "img" });
   const title = makeEl({ class: "clip-title" });
-  const outputs = makeEl({ class: "outputs" });
-  const more = makeEl({ class: "more" });
+  const outCell = makeEl({ class: "cell" });
+  let placeholder = null;
+  if (withOutputs) {
+    const outputs = makeEl({ class: "outputs" });
+    outputs.appendChild(link);
+    link.appendChild(img);
+    outCell.appendChild(outputs);
+  } else {
+    placeholder = makeEl({ class: "out-placeholder" });
+    outCell.appendChild(placeholder);
+  }
   row.appendChild(pick);
   row.appendChild(btn);
-  link.appendChild(img);
-  row.appendChild(link);
   row.appendChild(title);
-  outputs.appendChild(more);
-  row.appendChild(outputs);
-  return { row, pick, btn, img, link, title, outputs, more };
+  row.appendChild(outCell);
+  return { row, pick, btn, img, link, title, outCell, placeholder };
 }
 
 function click(el) {
@@ -121,7 +139,8 @@ function click(el) {
   handlers.forEach((fn) => fn({ target: el }));
 }
 
-const parts = buildRow();
+const parts = buildRow(true);
+const empty = buildRow(false);
 const results = {};
 
 click(parts.img);
@@ -135,8 +154,36 @@ results.clickButton = called.openEditor.length === 0
   && called.taskAction.length === 1 && called.taskAction[0][1] === "retry";
 click(parts.title);
 results.clickTitle = called.openEditor.length === 1 && called.openEditor[0] === "T1";
-click(parts.more);
-results.clickOutputsArea = called.openEditor.length === 1;
+// 结果列: 有图时图片链接在上面已测; 未出图的占位符属于行内, 点它应打开编辑窗
+click(empty.placeholder);
+results.clickPlaceholder = called.openEditor.length === 1;
+click(empty.outCell);
+results.clickEmptyCell = called.openEditor.length === 1;
+
+// ---- rowHTML 的结果列: 有图 -> 图片链接; 无图 -> 占位符, 且列数与表头一致 ----
+const doneTask = {
+  id: "T9", seq: 9, status: "done", staged: false, kind: "generation",
+  prompt: "a red cube", negative_prompt: null, refs: [], origin: null,
+  created_at: 1789000000, error: null, warnings: [],
+  progress: { step: 4, total: 4 }, queue_position: null,
+  params: { width: 512, height: 512, steps: 4, n: 1, seed: 7, true_cfg_scale: 1 },
+  usage: { elapsed_sec: 11, queue_sec: 0, vram_peak_mb: 6400 },
+  outputs: [{ url: "/outputs/a.png", width: 512, height: 512, seed: 7 }],
+};
+const pendingTask = Object.assign({}, doneTask, {
+  id: "T8", seq: 8, status: "pending", staged: true, outputs: [],
+  usage: null, queue_position: 1,
+});
+const doneHTML = rowHTML(doneTask);
+const pendingHTML = rowHTML(pendingTask);
+results.renderDoneHasThumb = doneHTML.includes('href="/outputs/a.png"')
+  && doneHTML.includes("target=\"_blank\"") && doneHTML.includes("draggable=\"false\"");
+results.renderPendingHasPlaceholder = pendingHTML.includes("out-placeholder")
+  && !pendingHTML.includes("<img");
+// 结果列在参数列之后、进度列之前(用顶层单元格顺序断言)
+results.renderColumnOrder = /clip-info">[\s\S]*clip-meta">[\s\S]*class="(?:outputs|out-placeholder)"[\s\S]*class="cell">[\s\S]*data-act="retry"/
+  .test(doneHTML) && /class="(?:outputs|out-placeholder)"[\s\S]*class="cell">[\s\S]*data-act="retry"/
+  .test(pendingHTML);
 
 console.log(JSON.stringify(results));
 """
@@ -165,7 +212,11 @@ def main():
         check(res["clickCheckbox"], "点复选框只切换选中")
         check(res["clickButton"], "点行内按钮只触发该动作")
         check(res["clickTitle"], "点提示词区域才打开编辑窗")
-        check(res["clickOutputsArea"], "点结果区域空白处打开编辑窗")
+        check(res["clickPlaceholder"], "点结果列的占位符打开编辑窗")
+        check(res["clickEmptyCell"], "点结果列空白处打开编辑窗")
+        check(res["renderDoneHasThumb"], "已出图任务在结果列渲染图片链接(新标签页)")
+        check(res["renderPendingHasPlaceholder"], "未出图任务在结果列渲染占位符")
+        check(res["renderColumnOrder"], "结果列位于参数列与进度列之间")
         print()
         if FAILED:
             print(f"失败 {len(FAILED)} 项: {FAILED}")
