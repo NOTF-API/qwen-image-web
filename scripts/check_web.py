@@ -89,6 +89,72 @@ def main():
         if not (cols == heads == cells):
             ok = False
 
+    # dialog 默认隐藏: 解析 CSS 层叠, 确认未打开时 display 最终是 none。
+    # (曾经给 #viewer 设了 display:flex, 覆盖掉浏览器默认的 dialog{display:none},
+    #  导致页面一加载图片查看器就常驻显示 —— 这个检查就是为了不再犯。)
+    rules = []          # (selector, [declarations], 顺序)
+    style_blocks = re.findall(r"<style>(.*?)</style>", html, re.S)
+    if not style_blocks:
+        print("[FAIL] 页面里没有 <style> 块")
+        return 1
+    # 先去掉注释, 否则块前的注释会被当成选择器的一部分
+    css = re.sub(r"/\*.*?\*/", "", style_blocks[0], flags=re.S)
+    for block in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        selectors, body = block.group(1), block.group(2)
+        selectors = selectors.split("}")[-1].strip()
+        if not selectors or selectors.startswith("@"):
+            continue
+        decls = [d.strip() for d in body.split(";") if d.strip()]
+        for sel in selectors.split(","):
+            sel = " ".join(sel.split())
+            if not sel:
+                continue
+            rules.append((sel, decls, len(rules)))
+
+    def display_for(dialog_id, with_open_attr=False):
+        """作者样式里, 该 dialog 在指定状态下命中的最终 display(没有命中则 None)。
+
+        基座是浏览器默认样式 ``dialog { display: none }``(未带 open 属性时生效):
+        - 作者样式没有声明 display      -> 沿用 UA 的 none, 页面加载时隐藏(正确)
+        - 作者样式声明了 display:flex   -> 覆盖 UA, 页面一加载就常驻显示(错误)
+        所以下面只看「作者样式是否会覆盖」。
+        """
+        ident = f"#{dialog_id}"
+        applicable = {f"{ident}[open]": (1, 1, 0), f"{ident}:not([open])": (1, 1, 0),
+                      ident: (1, 0, 0), "dialog": (0, 0, 1)}
+        winner, win_key = None, (-1, -1, -1)
+        for sel, decls, order in rules:
+            spec = applicable.get(sel)
+            if spec is None:
+                continue
+            if sel == f"{ident}[open]" and not with_open_attr:
+                continue
+            if sel == f"{ident}:not([open])" and with_open_attr:
+                continue
+            for d in decls:
+                if d.lower().startswith("display"):
+                    value = d.split(":", 1)[1].strip()
+                    important = 1 if "!important" in value.lower() else 0
+                    value = value.replace("!important", "").strip()
+                    key = (important,) + spec + (order,)
+                    if key >= win_key:
+                        win_key, winner = key, value
+        return winner
+
+    for dialog_id in ("viewer", "editDialog"):
+        author_closed = display_for(dialog_id)
+        author_open = display_for(dialog_id, with_open_attr=True)
+        closed_ok = author_closed is None or "none" in author_closed.replace(" ", "").lower()
+        opened_ok = author_open is None or "none" not in author_open.replace(" ", "").lower()
+        print(f"[{'ok' if closed_ok else 'FAIL'}] {dialog_id} 未打开: "
+              f"作者样式 display={author_closed or '(未声明, 沿用浏览器默认 none)'}"
+              + ("" if closed_ok else " —— 覆盖了浏览器默认值, 页面加载就常驻显示"))
+        print(f"[{'ok' if opened_ok else 'FAIL'}] {dialog_id} 打开时: "
+              f"作者样式 display={author_open or '(未声明, 用浏览器默认)'}"
+              + ("" if opened_ok else " —— 打开后却是 none, 会看不见"))
+        if not (closed_ok and opened_ok):
+            ok = False
+
     print("语法检查请另行执行: node --check <--dump 出来的文件>")
     return 0 if ok else 1
 

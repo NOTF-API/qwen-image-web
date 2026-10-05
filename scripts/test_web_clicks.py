@@ -122,7 +122,12 @@ function makeStub(id) {
     setAttribute(k, v) { el.attrs[k] = v; if (k === "src") el.src = v; },
     getAttribute(k) { return el.attrs[k]; },
     showModal() { el.open = true; },
-    close() { el.open = false; },
+    // 真实浏览器里 dialog.close() 会派发 close 事件(Esc/按钮关闭同理),
+    // 页面正是靠它做清理, 所以这里必须一起派发。
+    close() {
+      el.open = false;
+      (el._listeners.close || []).forEach((fn) => fn({ type: "close" }));
+    },
     removeAttribute(k) { delete el.attrs[k]; if (k === "src") el.src = ""; },
   };
   return el;
@@ -281,8 +286,13 @@ stepViewer(-1);
 results.multiWrap = $("viewerImage").src === "/outputs/c.png"
   && $("viewerCount").textContent === "3 / 3";
 results.multiDownloadName = $("viewerDownload").getAttribute("download") === "c.png";
+// 关闭按钮走的是 form method="dialog" 的原生提交; 这里直接触发 close 事件路径
 closeViewer();
-results.closeClears = $("viewer").open === false && !$("viewerImage").src;
+results.closeClears = $("viewer").open === false && !$("viewerImage").src
+  && $("viewerStrip").hidden === true && $("viewerStrip").innerHTML === "";
+// 关闭按钮的点击处理器本身也要能关(handler 已注册)
+$("viewerClose")._listeners.click[0]();
+results.closeButtonWorks = $("viewer").open === false;
 
 // 单图任务: 隐藏列表与切换按钮
 state.tasks = [doneTask];
@@ -344,7 +354,8 @@ def main():
         check(res["multiNext"], "下一张切换到第 2 张")
         check(res["multiWrap"], "上一张可循环到第 3 张")
         check(res["multiDownloadName"], "下载按钮带上正确的文件名")
-        check(res["closeClears"], "关闭查看器后清空状态")
+        check(res["closeClears"], "关闭查看器后清空图片与列表状态")
+        check(res["closeButtonWorks"], "「关闭」按钮可以关闭查看器")
         check(res["singleHidesStrip"], "单图任务隐藏列表与切换按钮")
         check(res["singleCountText"], "单图任务显示 1/1")
         check(res["keyboardNext"], "← → 键可切换图片")
