@@ -18,6 +18,23 @@ outputs/
 # 运行日志
 *.log
 
+# 验证/调试日志目录
+.verify/
+
+# 临时调试脚本 (scripts/_*.py 是一次性的, 用完即删, 不要入库)
+scripts/_*.py
+
+# 本地环境变量 (本项目默认不需要, 别提交)
+.env
+.env.*
+
+# Python 缓存
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
 # IDE / 系统文件
 .vscode/
 .idea/

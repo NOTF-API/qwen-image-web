@@ -34,7 +34,12 @@ qwen-image/
 ├─ scripts/test_queue_gpu.py    队列 + 真模型集成测试 (需要 GPU)
 ├─ scripts/test_queue_loading.py 模型加载期入队测试 (需要 GPU)
 ├─ scripts/check_web.py   Web 页面内联脚本静态检查 (id 引用/接口路径)
-├─ scripts/test_web_clicks.py  页面点击语义测试 (点结果图不弹编辑窗)
+├─ scripts/test_web_clicks.py  页面交互测试 (点击语义/固定行序/分辨率校验/图片查看器)
+├─ scripts/test_api_live.py   对运行中的服务做接口完备性 + 网页一致性测试
+├─ scripts/check_api_doc.py   核对 docs/API_FOR_AI.md 与真实实现是否一致
+├─ scripts/test_oom_recovery_unit.py  OOM 后自动恢复的控制流测试（不占 GPU, 秒级）
+├─ docs/API_QUICK.md          **给 AI / Agent 读的精简接口说明**（可直接贴进系统提示词）
+├─ docs/API_FOR_AI.md         **给 AI / Agent 读的完整接口文档**
 ├─ wheels/                torch/torchvision 本地 wheel (cu128)
 └─ venv/                  Python 3.11 虚拟环境
 ```
@@ -57,9 +62,17 @@ start.bat
 也可以手动设 `QWEN_GGUF` 环境变量后 `python -u server.py`。
 
 启动后浏览器打开 **http://127.0.0.1:8091/** 即为**生图工作台**（左侧建任务：提示词/长宽比/
-步数/seed/张数/透明背景/引导强度/参考图上传；右侧任务队列：暂存、开始、取消、编辑提示词、
-重新生成、删除，以及每条的进度、耗时与出图缩览）。任务会落盘，**重启服务后仍在**，可继续
-编辑、重新生成或删除。纯 API 调用见下文。
+分辨率（长边或自定义宽×高）/步数/seed/张数/透明背景/引导强度/参考图上传；右侧任务队列：
+暂存、开始、取消、编辑提示词、重新生成、下载、删除，以及每条的进度、耗时与出图缩览）。任务会落盘，
+**重启服务后仍在**，可继续编辑、重新生成或删除。纯 API 调用见下文。
+
+> 行内 **↓** = 一次下完这条任务的全部产物（多张时按顺序逐张下载，浏览器可能询问是否允许
+> 下载多个文件）；还没出图的任务该按钮置灰。编辑窗与图片查看器都可以**点窗口外的遮罩**或
+> 按 **Esc** 关闭（输入法组词中的 Esc 会先让输入法取消候选，不关窗）。
+
+> 分辨率输入框实时显示最终画布：超过 1024 会黄字提示耗时/显存风险，超过单边硬上限
+> `QWEN_MAX_SIDE`（默认 1536，**启动时读环境变量**）直接红字报错并拒绝提交；服务端对
+> 显式 `size` 的缩放是兜底，网页不会再让你"提交了才发现被缩小"。
 
 首次启动会在后台预加载模型（**实测冷启动 110~120 秒**），`/health` 显示
 `load: loading -> ready`。之后每次生成（RTX 5060 Ti 8GB 实测）：
@@ -77,6 +90,14 @@ start.bat
 > 正式出图建议 20~40 步（默认 30）。
 
 ## API
+
+> **要交给 AI / Agent 调用？**
+> - 贴进系统提示词用精简版 → [`docs/API_QUICK.md`](docs/API_QUICK.md)（约 90 行，只留最常用接口）
+> - 需要完整参考 → [`docs/API_FOR_AI.md`](docs/API_FOR_AI.md)（含多参考图角色写法、参数全表、队列接口全表）
+>
+> 两份都写给模型读：30 秒上手、最容易踩的坑、参数速查表。
+> `scripts/check_api_doc.py` 会把文档的每条说法与真实服务实测对照，防止文档与实现漂移。
+> 下面这几节是给人看的完整参考。
 
 ### 1. 文生图 `POST /v1/images/generations`
 
@@ -184,8 +205,8 @@ GPU 只有一张，队列把生成串行化：**提交即返回**，出图在后
 |---|---|
 | `POST /v1/images/generations` + `queue: true` | 入队文生图任务，立即返回任务号（不占用 HTTP 连接等 GPU） |
 | `POST /v1/images/generations` + `prompts: [...]` | 一次把多条提示词拆成多条任务（最多 `QWEN_MAX_QUEUE_BATCH`，默认 16） |
-| `POST /v1/images/edits/json` | 图生图/编辑入队；`images` 可为 base64、data URL 或本站 `/outputs/xxx.png` 路径 |
-| `GET /api/queue` | 队列计数、当前任务、参数上限（步数/参考图数/长宽比表） |
+| `POST /v1/images/edits/json` | 图生图/编辑入队；`images` 可为 base64、data URL 或本站 `/outputs/xxx.png` 路径。同样支持 `queue: true` 与 `prompts: [...]`（多条提示词共用同一组参考图） |
+| `GET /api/queue` | 队列计数、当前任务、参数上限（步数/参考图数/长宽比表/分辨率上限 `max_side` + `default_long_side`/`min_side`/`side_step`） |
 | `GET /api/tasks?status=pending&limit=50` | 任务列表（未结束在前按提交顺序，已结束在后按完成时间倒序） |
 | `GET /api/tasks/{id}` | 单条任务详情（参数、进度、产物、耗时、显存峰值） |
 | `PATCH /api/tasks/{id}` | 编辑**未开始**任务的提示词与参数（运行中/已结束返回 409） |
@@ -231,7 +252,11 @@ const id = q.data[0].id;                       // 202/200 + {queued:1, data:[{id
 
 - `GET /health` — 加载状态 / 显存 / 队列计数 / 当前任务
 - `GET /v1/models` — OpenAI 兼容模型列表
+- `GET /api` — 接口清单与能力说明
 - `GET /docs` — Swagger 交互式文档
+
+> `response_format` 只在**同步**接口上有意义：`"b64_json"` 会在 `data[i]` 里额外带上
+> `b64_json` 字段（图片同时照旧落盘，仍可 `url` 下载）；入队任务一律返回 `url`。
 
 ## JS 调用（浏览器 / Node 通用）
 
@@ -262,7 +287,9 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 | `QWEN_LONG_SIDE` | 1024 | 默认出图长边（8GB 卡建议 1024~1280） |
 | `QWEN_MAX_SIDE` | 1536 | 长边硬上限（超了自动缩放并提示） |
 | `QWEN_STEPS` | 30 | 默认步数（官方 40 更精细但更慢） |
+| `QWEN_MAX_STEPS` | 60 | 单请求 `steps` 取值范围 1~此值，越界直接报错 |
 | `QWEN_TRUE_CFG_SCALE` | 1.0 | 默认引导强度。**1.0 = 官方无引导采样**，此时 `negative_prompt` 被忽略；设 >1 才启用 CFG（更慢）。单次请求可用 `true_cfg_scale` 覆盖 |
+| `QWEN_MAX_TRUE_CFG_SCALE` | 20 | 单请求 `true_cfg_scale` 取值范围 1.0~此值，越界直接报错 |
 | `QWEN_OUTPUT_RESOLUTION` | 跟随出图长边 | 参考图缩放基准（管线 `output_resolution`）。0/不设 = 自动（编辑器路径取 `min(出图长边, QWEN_EDIT_OUTPUT_RESOLUTION)`）。单次请求可用 `output_resolution` 覆盖 |
 | `QWEN_EDIT_OUTPUT_RESOLUTION` | 1024 | 带参考图时 `output_resolution` 的默认上限。**抬高会明显变慢**：参考图 token 与视觉编码器 prefill 都随之增长；1024 与文档耗时基准一致 |
 | `QWEN_REF_INDEX` | 0 | 多参考图时按第几张定画布长宽比（0 = 第一张；-1 = 最后一张，与管线内部语义一致）。单次请求可用 `ref_index` 覆盖 |
@@ -304,11 +331,26 @@ venv\Scripts\python.exe scripts\test_queue_gpu.py
 # 模型加载期间入队（需要 GPU，约 1 分钟：任务不失败，就绪后自动开始）
 venv\Scripts\python.exe scripts\test_queue_loading.py
 
-# 页面点击语义（需要 node）：点结果图只打开图片，不弹编辑窗
+# 页面交互语义（需要 node）：点结果图只打开图片、不弹编辑窗；行内 ↓ 下载；弹窗遮罩/Esc 可关
 venv\Scripts\python.exe scripts\test_web_clicks.py
+
+# 对**已经开着的服务**做接口完备性 + 与网页一致性测试（接口齐全、参数归一化、
+# 队列生命周期、参考图、真出图链路）。加 --no-gpu 跳过真出图，秒级完成
+venv\Scripts\python.exe scripts\test_api_live.py --no-gpu
+venv\Scripts\python.exe scripts\test_api_live.py
+
+# 核对 docs/API_FOR_AI.md 的每条说法与真实服务一致（改完接口记得跑）
+venv\Scripts\python.exe scripts\check_api_doc.py
+
+# OOM 后自动恢复的控制流（不占 GPU，秒级：直接注入「状态损坏」异常验证恢复逻辑）
+venv\Scripts\python.exe scripts\test_oom_recovery_unit.py
 ```
 
 前两个与最后一个脚本不碰 `outputs/` 与真实模型，可随时跑；中间两个会占用 GPU。
+
+> `test_api_live.py` 只做**功能验证**，真出图一律压到最小分辨率（≤256px、≤8 步），
+> 免得一轮测试把 GPU 占满。想看出图效果请用网页或 `examples/client.mjs`。
+> 它只删自己逐条记录下的任务 ID，结束时还会核对「进场时的任务一条没少」。
 
 ## 模型与依赖重装（全国内镜像）
 
@@ -340,8 +382,11 @@ torch wheel 来源（37MB/s）：`https://mirror.sjtu.edu.cn/pytorch-wheels/cu12
 | `/health` 一直 `loading` | 冷启动 1~3 分钟（NF4 量化 17.6GB 权重）；看服务控制台日志 |
 | `torch.cuda.is_available()=False` | torch 装成了 CPU 版，重装上面第 2 步的 cu128 wheel |
 | OOM (HTTP 413) | 降 `QWEN_MAX_SIDE=1024`，或 `QWEN_OFFLOAD=sequential`，关浏览器/游戏释放显存 |
+| 出图报 `Expected all tensors to be on the same device` | 显存搬运状态被打断（通常由 OOM 引发）。**服务会自动重建模型并重试，无需重启**（约 40 秒，期间 `/health` 的 `load` 显示 `loading`）。`/health` 的 `offload_recovered_at` 会记下最近一次自愈时间；一直不恢复才需重启 |
 | 生成时返回 503「提交余量不足」 | 开启了 `QWEN_MIN_MEM_GB` 提交余量预检（默认关闭）；关闭其他大内存程序，或把阈值调低/设 `0` |
 | 服务进程崩溃(access violation / 闪退) | 多为内存·显存被其他进程挤占（2026-09-26 实测：外部进程占 4.5GB 显存 + 可用内存 1.7GB 时，TE 搬回 CPU 触发 0xc0000005）。保持 4GB+ 可用内存；`faulthandler` 会把崩溃时的 C 栈打到控制台 |
+| 报 `numpy._ArrayMemoryError: Unable to allocate` | **系统内存耗尽**，不是显存问题。服务本身常驻约 24GB 系统内存，32GB 机器满载时只剩 1.3GB 可用、可用提交 0.1MB 级，连 44MB 都分配不出来（2026-10-02 实测）。关掉占内存的大程序后重启服务；这类失败重建模型也解决不了 |
+| 出图报 `Expected all tensors to be on the same device` | 显存搬运状态被打断（通常由 OOM 或内存耗尽引发）。**服务会自动重建模型并重试，无需重启**（约 40 秒，期间 `/health` 的 `load` 显示 `loading`）。`/health` 的 `offload_recovered_at` 会记下最近一次自愈时间；若重建后仍失败，多半是上面的内存耗尽，先查系统内存 |
 | 想要更高画质 | 启动时选 `Q5_K_M`/`Q5_K_S`（见上文「启动」），或设 `QWEN_GGUF=qwen-image-2.1-Q5_K_M.gguf`；两档显存峰值都在 ~6.4GB（以 `/health` 的 `vram_peak_mb` 为准）。**注意**：Q5_K_M 搬运需 5GB 提交内存，16GB 内存机器连续生成可能在第 2 张触发原生崩溃（2026-09-27 插桩实测：解码前提交余量仅剩 1.25GB < 需求 4.99GB）；加内存到 32GB 后余量充足即无此问题 |
 | 出图有规则网格纹 | 分两类：①**低步数**（<12）的细网格是模型非蒸馏特性，加步数到 20~40；②**高步数残留的淡线**是 VAE 分块解码接缝（每 192px 一条，1024² 正好 5×5），默认 `QWEN_VAE_TILING=auto` 已在文生图 ≤1024 自动关闭。与量化档位无关（Q4/Q5 实测同样表现），同 seed 开关分块差值仅 ~0.5/255 灰阶。完整排查过程见 `docs/grid-artifact-fix.md` |
 | 取消后还在跑 | 取消在**采样步边界**生效：当前步跑完才中断（30 步约 3 秒/步），界面会显示「取消中…」。进程被强杀除外——那属于中断，重启后任务会自动重新排队 |
@@ -351,4 +396,6 @@ torch wheel 来源（37MB/s）：`https://mirror.sjtu.edu.cn/pytorch-wheels/cu12
 
 ## 许可
 
-模型权重遵循 **Qwen Research License**（非商用需另行申请）。
+本项目代码以 **MIT** 协议开源，见 [LICENSE](LICENSE)。
+
+模型权重遵循 **Qwen Research License**（非商用需另行申请）。`scripts/download_model.ps1` 只负责拉取上游权重，权重本身不在本仓库内。
