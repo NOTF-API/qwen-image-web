@@ -1,351 +1,1372 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Qwen-Image-2.1 本地生图</title>
-<style>
-:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--text:#e8eaf0;--muted:#8b93a7;
-      --accent:#6ea8fe;--ok:#3ddc84;--warn:#ffb020;--err:#ff5d5d;--border:#2a2f3a}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);
-     font:15px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-header{display:flex;align-items:center;justify-content:space-between;gap:12px;
-       padding:14px 20px;border-bottom:1px solid var(--border);position:sticky;top:0;
-       background:rgba(15,17,21,.92);backdrop-filter:blur(6px);z-index:10;flex-wrap:wrap}
-h1{font-size:18px;margin:0;font-weight:650}
-h1 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:12px}
-#status{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--muted);flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
-      background:var(--panel2);border:1px solid var(--border);white-space:nowrap}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}
-main{display:grid;grid-template-columns:390px 1fr;gap:18px;padding:18px;max-width:1440px;margin:0 auto}
-@media (max-width:920px){main{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;align-self:start}
-label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
-label:first-child{margin-top:0}
-textarea,input[type=number],input[type=text],select{width:100%;background:var(--panel2);
-  color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font:inherit;outline:none}
-textarea{min-height:92px;resize:vertical}
-textarea:focus,input:focus,select:focus{border-color:var(--accent)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-input[type=range]{width:100%;margin-top:14px;accent-color:var(--accent)}
-button{width:100%;margin-top:16px;padding:12px;border:none;border-radius:10px;
-       background:var(--accent);color:#0b1020;font-weight:650;font-size:15px;cursor:pointer}
-button:disabled{opacity:.45;cursor:not-allowed}
-button:hover:not(:disabled){filter:brightness(1.08)}
-#timer{text-align:center;color:var(--muted);font-size:13px;min-height:20px;margin-top:8px}
-.check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px;margin-top:12px}
-.check input{accent-color:var(--accent);width:16px;height:16px}
-#msg{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;word-break:break-all}
-#msg.err{display:block;background:rgba(255,93,93,.12);border:1px solid rgba(255,93,93,.4);color:#ffb3b3}
-#msg.info{display:block;background:rgba(61,220,132,.1);border:1px solid rgba(61,220,132,.35);color:#9cf0c4}
-.result-empty{color:var(--muted);text-align:center;padding:60px 20px;
-              border:1px dashed var(--border);border-radius:12px}
-img.preview{width:100%;border-radius:10px;background:#000;display:block;margin-bottom:10px}
-.meta{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin-top:10px}
-.meta b{color:var(--text);font-weight:600}
-#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
-#gallery a{display:block;border:1px solid var(--border);border-radius:8px;overflow:hidden;
-           aspect-ratio:1;background:var(--panel2)}
-#gallery img{width:100%;height:100%;object-fit:cover;display:block}
-h2{font-size:13px;margin:20px 0 10px;color:var(--muted);font-weight:600;letter-spacing:.5px}
-footer{padding:4px 20px 26px;color:var(--muted);font-size:12px;text-align:center}
-footer a{color:var(--accent);text-decoration:none;margin:0 8px}
-input[type=file]{color:var(--muted);font-size:13px}
-#refs{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:8px;margin-top:8px}
-#refs .ref{position:relative;aspect-ratio:1;border-radius:8px;overflow:hidden;
-           border:1px solid var(--border);background:var(--panel2)}
-#refs .ref img{width:100%;height:100%;object-fit:cover;display:block}
-#refs .ref span{position:absolute;left:3px;top:3px;padding:1px 5px;border-radius:5px;
-                background:rgba(0,0,0,.72);color:#fff;font-size:11px;line-height:1.5}
-#refs .ref.canvas{border-color:var(--accent)}
-#warn{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;
-      background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.4);color:#ffd18a;
-      line-height:1.6;word-break:break-word}
-</style>
-</head>
-<body>
-<header>
-  <h1>Qwen-Image-2.1<small>本地生图服务 · 无需 ComfyUI</small></h1>
-  <div id="status">
-    <span class="pill"><span class="dot" id="loadDot"></span><span id="loadText">连接中…</span></span>
-    <span class="pill" id="vramPill">显存 –</span>
-    <span class="pill" id="queuePill">排队 0</span>
-  </div>
-</header>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qwen-Image-2.1 · 生图工作台</title>
+  <style>
+    * { box-sizing: border-box; }
 
-<main>
-  <section class="panel">
-    <label>提示词</label>
-    <textarea id="prompt" placeholder="描述想生成的画面，例如：雨夜里的霓虹招牌，写着 QWEN IMAGE 2.1，湿地反射，电影感灯光"></textarea>
+    html, body { margin: 0; height: 100%; }
 
-    <label>负提示词（可选）</label>
-    <textarea id="negative_prompt" style="min-height:50px" placeholder="不希望出现的元素，例如：blurry, low quality"></textarea>
-    <div style="font-size:12px;color:var(--warn);line-height:1.5;margin-top:4px">⚠ 本模型按「无引导」采样，负提示词默认<b>不生效</b>：只有把下面的引导强度调到 &gt;1 才启用 CFG</div>
-
-    <label>引导强度 true_cfg_scale <b id="cfgVal" style="color:var(--text)">1.0（关闭）</b></label>
-    <input type="range" id="cfg" min="1" max="10" step="0.5" value="1">
-    <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-top:4px">1.0 = 官方默认（无引导，最快）；&gt;1 才让负提示词参与采样，但会多一次前向、更慢</div>
-
-    <div class="row">
-      <div>
-        <label>长宽比</label>
-        <select id="ratio">
-          <option value="" selected>自动（编辑跟原图）</option>
-          <option value="1:1">1:1 方形</option>
-          <option value="4:3">4:3</option>
-          <option value="3:4">3:4</option>
-          <option value="3:2">3:2</option>
-          <option value="2:3">2:3</option>
-          <option value="16:9">16:9 横幅</option>
-          <option value="9:16">9:16 竖屏</option>
-        </select>
-      </div>
-      <div>
-        <label>步数 <b id="stepsVal" style="color:var(--text)">30</b>（质量/速度权衡）</label>
-        <input type="range" id="steps" min="1" max="60" value="30">
-        <div id="stepsWarn" style="display:none;color:var(--warn);font-size:12px;line-height:1.5;margin-top:4px">⚠ 步数过低会出糊图/格子伪影（去噪不收敛），正式出图建议 ≥20</div>
-      </div>
-    </div>
-
-    <div class="row">
-      <div><label>Seed（留空随机）</label><input type="number" id="seed" placeholder="随机"></div>
-      <div><label>张数</label>
-        <select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select>
-      </div>
-    </div>
-
-    <label>参考图（可选，传图即走图生图 / 多参考图编辑）</label>
-    <input type="file" id="files" accept="image/*" multiple>
-    <div style="font-size:12px;color:var(--muted);line-height:1.55;margin-top:6px">
-      模型按<b>位置</b>引用参考图，提示词里可写 <code>&lt;image1&gt;</code> <code>&lt;image2&gt;</code> …（最多 10 张），
-      例如「把 &lt;image2&gt; 的配色套到 &lt;image1&gt; 的产品上」。
-    </div>
-    <div id="refs"></div>
-
-    <div class="check">
-      <input type="checkbox" id="transparent">
-      <label for="transparent" style="margin:0;color:var(--text)">透明背景 PNG</label>
-    </div>
-
-    <div id="warn" style="display:none"></div>
-
-    <button id="go" disabled>模型加载中…</button>
-    <div id="timer"></div>
-    <div id="msg"></div>
-  </section>
-
-  <section class="panel">
-    <div id="empty" class="result-empty">
-      输入提示词后点击「生成」<br><br>
-      1024×1024 / 30 步约 <b>86 秒</b>，16:9 约 49 秒<br>
-      页面顶部可随时查看加载状态与显存占用
-    </div>
-    <div id="result" style="display:none">
-      <div id="imgs"></div>
-      <div class="meta" id="meta"></div>
-      <div class="meta" id="usage" style="margin-top:2px"></div>
-    </div>
-    <div id="galleryWrap" style="display:none">
-      <h2>本次会话记录（点击看原图）</h2>
-      <div id="gallery"></div>
-    </div>
-  </section>
-</main>
-
-<footer>
-  OpenAPI 文档 <a href="/docs">/docs</a> ·
-  健康检查 <a href="/health">/health</a> ·
-  接口说明 <a href="/api">/api</a>
-</footer>
-
-<script>
-const $ = id => document.getElementById(id);
-let ready = false, timerId = null;
-
-async function pollHealth() {
-  try {
-    const h = await fetch('/health').then(r => r.json());
-    ready = h.load === 'ready';
-    $('loadDot').className = 'dot ' + (h.load === 'ready' ? 'ok'
-      : h.load === 'loading' ? 'warn' : h.load === 'error' ? 'err' : '');
-    $('loadText').textContent = h.load === 'ready' ? '就绪'
-      : h.load === 'loading' ? '模型加载中…' : h.load === 'error' ? '加载出错' : '空闲';
-    $('vramPill').textContent = `显存 ${h.vram.used_mb} / ${h.vram.total_mb} MB`;
-    $('queuePill').textContent = '排队 ' + h.waiting;
-    if (!timerId) {
-      $('go').disabled = !ready;
-      $('go').textContent = ready ? '生成' : '模型加载中…';
+    body {
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      font-size: 12px;
+      color: #cfd4da;
+      background: #0c0e11;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
-    if (h.load === 'error') show('err', '模型加载失败: ' + (h.error || '未知错误'));
-  } catch (e) {
-    $('loadDot').className = 'dot err';
-    $('loadText').textContent = '服务未连接';
-    if (!timerId) $('go').disabled = true;
-  }
-}
 
-function show(cls, text) { const m = $('msg'); m.className = cls; m.textContent = text; }
-function clearMsg() { const m = $('msg'); m.className = ''; m.textContent = ''; }
-function showWarn(list) {
-  const el = $('warn');
-  if (!list || !list.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
-  el.innerHTML = '<b>提示</b><br>' + list.join('<br>');
-  el.style.display = 'block';
-}
+    /* ============ 顶部 ============ */
+    header {
+      flex: 0 0 auto;
+      min-height: 46px;
+      flex-wrap: wrap;
+      display: flex;
+      align-items: center;
+      padding: 8px 14px;
+      gap: 10px;
+      background: #111418;
+      border-bottom: 1px solid #1e2126;
+    }
 
-// 参考图缩略图: 标注 image1..imageN (模型按此顺序引用), 并标出定画布比例的那张
-function renderRefs() {
-  const wrap = $('refs');
-  const files = [...$('files').files];
-  wrap.innerHTML = '';
-  // 注意: 下方的标记在图片实际加载后补, 避免读不到尺寸时误标第一张
-  const refs = files.map(() => {
-    const d = document.createElement('div');
-    d.className = 'ref';
-    wrap.appendChild(d);
-    return d;
-  });
-  files.forEach((f, i) => {
-    const url = URL.createObjectURL(f);
-    const img = document.createElement('img');
-    img.src = url;
-    img.alt = 'image' + (i + 1);
-    const badge = document.createElement('span');
-    badge.textContent = 'image' + (i + 1);
-    refs[i].appendChild(img);
-    refs[i].appendChild(badge);
-    img.addEventListener('load', () => {
-      // 只有比例未手动指定(留空=自动)时, 画布才跟随第一张
-      if (i === 0 && !$('ratio').value && img.naturalWidth && img.naturalHeight) {
-        refs[0].classList.add('canvas');
-        refs[0].title = '画布长宽比跟随此图 (ref_index=0)';
+    .brand { display: flex; align-items: baseline; gap: 8px; }
+    .brand .title { font-size: 13px; font-weight: 700; color: #e6ebf0; }
+    .brand .subtitle { font-size: 10px; color: #9099a3; text-transform: uppercase; }
+    .spacer { flex: 1; }
+    .nav-link { color: #72e68a; font-size: 12px; text-decoration: none; white-space: nowrap; padding: 6px 0; }
+    .nav-link:hover { color: #b1f4bf; }
+    :focus-visible { outline: 2px solid #72e68a; outline-offset: 3px; }
+
+    .pill {
+      font: 10px monospace;
+      color: #8a949e;
+      padding: 4px 8px;
+      border-radius: 4px;
+      background: #16191d;
+      border: 1px solid #23272e;
+      white-space: nowrap;
+    }
+
+    .pill b { color: #cfd4da; font-weight: 600; }
+    .pill .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #4a5159; margin-right: 5px; }
+    .pill .dot.ok { background: #72e68a; }
+    .pill .dot.warn { background: #e6b800; }
+    .pill .dot.err { background: #e66; }
+
+    .queue-indicator {
+      font: 10px monospace;
+      color: #e6b800;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(230, 184, 0, .08);
+      border: 1px solid rgba(230, 184, 0, .25);
+      display: none;
+    }
+
+    .queue-indicator.on { display: inline-block; }
+
+    .tool-btn {
+      padding: 6px 12px;
+      font-size: 11px;
+      font-family: inherit;
+      color: #b8bfc6;
+      background: #1a1d22;
+      border: 1px solid #2a2e35;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: all .1s;
+    }
+
+    .tool-btn:hover:not(:disabled) { background: #22262c; color: #e6ebf0; border-color: #3a4048; }
+    .tool-btn:disabled { opacity: .35; cursor: not-allowed; }
+    .tool-btn.primary { color: #72e68a; border-color: #2f5a3a; background: #16261b; }
+    .tool-btn.primary:hover:not(:disabled) { background: #1d3424; }
+    .tool-btn.danger { color: #e66; border-color: #5a2828; }
+    .tool-btn.danger:hover:not(:disabled) { background: #2b1a1a; }
+
+    /* ============ 布局 ============ */
+    .layout { flex: 1; display: flex; overflow: hidden; }
+
+    aside {
+      flex: 0 0 300px;
+      overflow-y: auto;
+      background: #0f1216;
+      border-right: 1px solid #1e2126;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    aside::-webkit-scrollbar { width: 6px; }
+    aside::-webkit-scrollbar-thumb { background: #23272e; border-radius: 3px; }
+
+    main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+
+    footer {
+      flex: 0 0 auto;
+      height: 26px;
+      padding: 0 14px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font: 11px monospace;
+      color: #586069;
+      background: #111418;
+      border-top: 1px solid #1e2126;
+    }
+
+    footer .stat { display: flex; align-items: center; gap: 5px; }
+    footer .stat b { color: #8a949e; font-weight: 600; }
+    footer .sep { color: #2a2e35; }
+
+    /* ============ 侧栏卡片 ============ */
+    .card { border-bottom: 1px solid #272c32; padding: 4px 4px 16px; }
+
+    .card h3 {
+      margin: 0 0 10px 0;
+      font-size: 12px;
+      font-weight: 700;
+      color: #a5afb9;
+      text-transform: uppercase;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .card h3 .badge { font: 10px monospace; font-weight: 400; color: #586069; text-transform: none; }
+    .field { margin-bottom: 8px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label { display: block; margin-bottom: 4px; font-size: 10px; color: #586069; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+    input[type="text"],
+    input[type="number"],
+    input[type="search"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 6px 9px;
+      font-size: 12px;
+      font-family: inherit;
+      color: #c8ced5;
+      background: #0c0e11;
+      border: 1px solid #2a2e35;
+      border-radius: 5px;
+      outline: none;
+      transition: border-color .1s, background .1s, color .1s;
+    }
+
+    input:hover, select:hover, textarea:hover { border-color: #3a4048; }
+    input:focus, select:focus, textarea:focus { border-color: #4a7ef2; background: #0e1116; }
+    textarea { resize: vertical; min-height: 72px; line-height: 1.5; cursor: text; }
+    select { cursor: pointer; }
+    select option { background: #14171c; }
+    input[type=range] { width: 100%; margin: 2px 0 0; accent-color: #72e68a; }
+    input[type=file] { color: #8a949e; font-size: 11px; width: 100%; }
+    input[type=checkbox] { accent-color: #79dab6; cursor: pointer; }
+
+    .btn {
+      width: 100%;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      font-weight: 600;
+      color: #b8bfc6;
+      background: #1a1d22;
+      border: 1px solid #2a2e35;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: all .1s;
+    }
+
+    .btn:hover:not(:disabled) { background: #22262c; color: #e6ebf0; border-color: #3a4048; }
+    .btn:active:not(:disabled) { transform: translateY(1px); }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn.primary { color: #72e68a; border-color: #2f5a3a; background: #16261b; }
+    .btn.primary:hover:not(:disabled) { background: #1d3424; }
+    .btn.small { font-size: 11px; padding: 6px 8px; font-weight: 400; }
+
+    .gen-status {
+      font: 10px monospace;
+      color: #586069;
+      margin-top: 6px;
+      min-height: 14px;
+      overflow-wrap: anywhere;
+    }
+
+    .gen-status.gen { color: #e6b800; }
+    .gen-status.ok { color: #72e68a; }
+    .gen-status.err { color: #e66; }
+
+    .generation-actions { display: grid; gap: 8px; }
+    .auto-generate { display: flex; align-items: center; gap: 7px; margin-top: 12px; color: #b8bfc6; font-size: 11px; cursor: pointer; }
+    .queue-hint { margin: 8px 0 0; color: #a4a9af; font-size: 11px; line-height: 1.6; }
+    .warn-note { color: #e6b800; font-size: 10px; line-height: 1.5; margin-top: 4px; }
+    .muted-note { color: #586069; font-size: 10px; line-height: 1.55; margin-top: 4px; }
+
+    #refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 6px; margin-top: 6px; }
+    #refs .ref { position: relative; aspect-ratio: 1; border-radius: 5px; overflow: hidden; border: 1px solid #23272e; background: #0c0e11; }
+    #refs .ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #refs .ref span {
+      position: absolute; left: 2px; top: 2px; padding: 1px 4px; border-radius: 3px;
+      background: rgba(0, 0, 0, .72); color: #fff; font: 9px monospace;
+    }
+    #refs .ref.canvas { border-color: #72e68a; }
+    #refs .ref button {
+      position: absolute; right: 2px; top: 2px; width: 16px; height: 16px; padding: 0;
+      font-size: 11px; line-height: 14px; color: #e66; background: rgba(0, 0, 0, .7);
+      border: 1px solid #5a2828; border-radius: 3px; cursor: pointer;
+    }
+
+    /* ============ 任务列表 ============ */
+    .library-bar {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+      padding: 12px 14px; border-bottom: 1px solid #303238;
+    }
+
+    .library-bar h2 { font-size: 15px; margin: 0; color: #e5e5e5; }
+    .library-bar .tool-btn { min-height: 28px; }
+    .library-bar label { color: #8a949e; font-size: 11px; display: flex; align-items: center; gap: 5px; }
+    .library-bar input[type=search] { min-width: 120px; width: 190px; padding: 6px 9px; }
+    .library-bar select { width: auto; min-width: 96px; padding: 6px 8px; }
+
+    .library-scroll { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+
+    .list-header, .task-row {
+      display: grid;
+      grid-template-columns: 22px 26px 46px 82px minmax(150px, 1fr) 148px 96px 28px 28px 28px 28px;
+      gap: 4px;
+      align-items: center;
+    }
+
+    .list-header, .list { min-width: 1000px; }
+
+    .list-header {
+      position: sticky; top: 0; z-index: 2;
+      padding: 6px 10px;
+      background: #111418;
+      border-bottom: 1px solid #1e2126;
+      font: 10px monospace;
+      color: #586069;
+      text-transform: uppercase;
+    }
+
+    .list-header .hdr { text-align: center; }
+    .list-header .hdr.left { text-align: left; padding-left: 2px; }
+
+    .list { flex: 1; }
+    .list::-webkit-scrollbar { width: 8px; }
+    .list::-webkit-scrollbar-thumb { background: #23272e; border-radius: 4px; }
+    .list::-webkit-scrollbar-thumb:hover { background: #2e333b; }
+
+    .task-row {
+      padding: 10px;
+      border-bottom: 1px solid #16191d;
+      font-size: 11px;
+      position: relative;
+      transition: background .1s;
+    }
+
+    .task-row:hover { background: rgba(255, 255, 255, .02); }
+
+    .task-row::before {
+      content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+      background: transparent; transition: background .1s;
+    }
+
+    .task-row.pending::before { background: #4a7ef2; }
+    .task-row.staged::before { background: #a8a862; }
+    .task-row.running::before { background: #e6b800; }
+    .task-row.canceling::before { background: #e6b800; }
+    .task-row.done::before { background: #72e68a; }
+    .task-row.failed::before { background: #e66; }
+    .task-row.canceled::before { background: #3a4048; }
+
+    .task-row.running, .task-row.canceling { background: rgba(230, 184, 0, .07); }
+    .task-row.staged { background: rgba(168, 168, 98, .05); }
+    .task-row.done { background: rgba(114, 230, 138, .04); }
+    .task-row.failed { background: rgba(230, 102, 102, .05); }
+
+    .task-row .row-badge {
+      position: absolute; right: 8px; top: 2px; font: 9px monospace; padding: 2px 6px;
+      border-radius: 3px; pointer-events: none;
+    }
+
+    .task-row.running .row-badge { color: #e6b800; background: rgba(230, 184, 0, .15); }
+    .task-row.staged .row-badge { color: #a8a862; background: rgba(168, 168, 98, .12); }
+
+    .idx { text-align: right; padding-right: 4px; font: 10px monospace; color: #4a5159; }
+    .kind { text-align: center; font: 10px monospace; color: #8a949e; }
+    .cell { min-width: 0; }
+    .cell.center { text-align: center; }
+
+    .badge-status { font: 10px monospace; padding: 2px 6px; border-radius: 3px; white-space: nowrap; }
+    .st-pending { color: #8fb8f2; background: rgba(74, 126, 242, .14); }
+    .st-staged { color: #a8a862; background: rgba(168, 168, 98, .14); }
+    .st-running { color: #e6b800; background: rgba(230, 184, 0, .16); }
+    .st-canceling { color: #e6b800; background: rgba(230, 184, 0, .16); }
+    .st-done { color: #72e68a; background: rgba(114, 230, 138, .14); }
+    .st-failed { color: #e66; background: rgba(230, 102, 102, .16); }
+    .st-canceled { color: #8a949e; background: rgba(138, 148, 158, .14); }
+
+    .clip-info { min-width: 0; }
+    .clip-title { color: #ececee; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .clip-meta { color: #a4a9af; padding-top: 3px; font-size: 10px; overflow-wrap: anywhere; }
+    .clip-error { color: #f09191; }
+    .clip-warn { color: #deb777; }
+
+    .outputs { display: flex; gap: 4px; flex-wrap: wrap; }
+    .outputs a { display: block; width: 30px; height: 30px; border: 1px solid #23272e; border-radius: 4px; overflow: hidden; }
+    .outputs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .outputs .more { font: 10px monospace; color: #8a949e; align-self: center; }
+
+    .progress-wrap { display: flex; align-items: center; gap: 6px; }
+    .progress-bar { flex: 1; height: 5px; background: #1a1d22; border-radius: 3px; overflow: hidden; min-width: 40px; }
+    .progress-bar i { display: block; height: 100%; background: #e6b800; }
+    .progress-text { font: 10px monospace; color: #e6b800; white-space: nowrap; }
+
+    .icon-btn {
+      width: 26px; height: 26px; padding: 0; font-size: 12px; line-height: 24px;
+      text-align: center; color: #6a737d; background: #16191d; border: 1px solid #23272e;
+      border-radius: 4px; cursor: pointer; transition: all .1s;
+    }
+
+    .icon-btn:hover:not(:disabled) { background: #1e2228; color: #cfd4da; }
+    .icon-btn:disabled { opacity: .25; cursor: not-allowed; }
+    .icon-btn.regen { color: #e6b800; border-color: #4a4018; }
+    .icon-btn.regen:hover:not(:disabled) { background: #2b2408; }
+    .icon-btn.go { color: #72e68a; border-color: #2f5a3a; }
+    .icon-btn.go:hover:not(:disabled) { background: #16261b; }
+    .icon-btn.del:hover:not(:disabled) { color: #e66; border-color: #5a2828; background: #2b1a1a; }
+
+    .empty { padding: 70px 20px; text-align: center; color: #adb2b7; font-size: 12px; }
+    .empty b { color: #586069; display: block; margin-bottom: 6px; font-size: 13px; }
+
+    dialog {
+      width: min(560px, calc(100% - 32px));
+      max-height: 90vh; overflow-y: auto; padding: 22px;
+      color: #ddd; background: #191b1e; border: 1px solid #4a4c50; border-radius: 8px;
+    }
+
+    dialog::backdrop { background: #0009; }
+    dialog h2 { margin: 0 0 6px; font-size: 17px; }
+    dialog .sub { color: #8a949e; font-size: 11px; margin-bottom: 16px; line-height: 1.6; }
+    dialog .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+    dialog .actions .tool-btn { min-height: 30px; }
+    .dialog-refs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .dialog-refs img { width: 52px; height: 52px; object-fit: cover; border: 1px solid #23272e; border-radius: 4px; }
+
+    [hidden] { display: none !important; }
+    .advanced-controls summary { padding: 12px 4px; color: #bfc4c8; cursor: pointer; }
+    .advanced-controls .card { margin-top: 12px; }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <div class="brand">
+      <span class="title">Qwen-Image-2.1</span>
+      <span class="subtitle">生图工作台</span>
+    </div>
+    <span class="pill" id="modelPill"><span class="dot" id="loadDot"></span><span id="loadText">连接中…</span></span>
+    <span class="pill" id="vramPill">显存 –</span>
+    <div class="spacer"></div>
+    <a class="nav-link" href="/docs" target="_blank" rel="noreferrer">接口文档</a>
+    <span class="queue-indicator" id="queueIndicator"></span>
+    <button class="tool-btn primary" id="startBatchBtn" disabled>开始队列</button>
+    <button class="tool-btn" id="refreshBtn" title="刷新任务列表">↻</button>
+  </header>
+
+  <div class="layout">
+
+    <!-- ============ 侧栏: 新建任务 ============ -->
+    <aside>
+
+      <section class="card">
+        <h3>新建任务 <span class="badge" id="ptHint">–</span></h3>
+        <div class="field">
+          <label for="genPrompt">提示词</label>
+          <textarea id="genPrompt" placeholder="描述想生成的画面，例如：雨夜里的霓虹招牌，写着 QWEN IMAGE 2.1，湿地反射，电影感灯光"></textarea>
+          <div class="muted-note">留空行分隔可一次暂存多条任务（每条一个独立任务）。</div>
+        </div>
+        <div class="field">
+          <label for="genNegative">负提示词（可选）</label>
+          <textarea id="genNegative" style="min-height:46px" placeholder="不希望出现的元素，例如：blurry, low quality"></textarea>
+          <div class="warn-note">⚠ 本模型按「无引导」采样，负提示词默认不生效：引导强度 &gt;1 才启用 CFG</div>
+        </div>
+        <div class="field">
+          <label for="genCfg">引导强度 true_cfg_scale <b id="cfgVal" style="color:#cfd4da">1.0（关闭）</b></label>
+          <input type="range" id="genCfg" min="1" max="10" step="0.5" value="1">
+          <div class="muted-note">1.0 = 官方默认（无引导，最快）；&gt;1 才让负提示词参与采样，但会多一次前向、更慢</div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="genRatio">长宽比</label>
+            <select id="genRatio">
+              <option value="" selected>自动（编辑跟原图）</option>
+              <option value="1:1">1:1 方形</option>
+              <option value="4:3">4:3</option>
+              <option value="3:4">3:4</option>
+              <option value="3:2">3:2</option>
+              <option value="2:3">2:3</option>
+              <option value="16:9">16:9 横幅</option>
+              <option value="9:16">9:16 竖屏</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="genSteps">步数 <b id="stepsVal" style="color:#cfd4da">30</b></label>
+            <input type="range" id="genSteps" min="1" max="60" value="30">
+            <div class="warn-note" id="stepsWarn" hidden>⚠ 步数过低会出糊图/格子伪影，正式出图建议 ≥20</div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="genSeed">Seed（留空随机）</label>
+            <input type="number" id="genSeed" placeholder="随机">
+          </div>
+          <div class="field">
+            <label for="genN">张数</label>
+            <select id="genN"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="genFiles">参考图（可选，传图即走图生图 / 多参考图编辑）</label>
+          <input type="file" id="genFiles" accept="image/*" multiple>
+          <div class="muted-note">
+            模型按<b>位置</b>引用参考图，提示词里可写 <code>&lt;image1&gt;</code> <code>&lt;image2&gt;</code> …
+            （最多 10 张），例如「把 &lt;image2&gt; 的配色套到 &lt;image1&gt; 的产品上」。
+          </div>
+          <div id="refs"></div>
+        </div>
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:7px;color:#b8bfc6">
+            <input type="checkbox" id="genTransparent"> 透明背景 PNG
+          </label>
+        </div>
+        <div class="generation-actions">
+          <button class="btn" id="genBtn" title="Ctrl / ⌘ + Enter">+ 暂存任务</button>
+          <button class="btn primary" id="genRunBtn" hidden>+ 加入生成队列</button>
+        </div>
+        <label class="auto-generate">
+          <input type="checkbox" id="autoGenerate" checked> 加入后自动生成
+        </label>
+        <p class="queue-hint" id="queueHint">未勾选时会先暂存，点「开始队列」统一开始。</p>
+        <div class="gen-status" id="genStatus" role="status">就绪</div>
+      </section>
+
+      <details class="advanced-controls">
+        <summary>统计与清理</summary>
+
+        <section class="card">
+          <h3>任务统计</h3>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; font-size:11px;">
+            <div style="color:#586069">暂存</div>
+            <div style="text-align:right;color:#a8a862" id="statStaged">0</div>
+            <div style="color:#586069">待开始</div>
+            <div style="text-align:right;color:#8fb8f2" id="statQueue">0</div>
+            <div style="color:#586069">运行中</div>
+            <div style="text-align:right;color:#e6b800" id="statRunning">0</div>
+            <div style="color:#586069">已出图</div>
+            <div style="text-align:right;color:#72e68a" id="statDone">0</div>
+            <div style="color:#586069">失败</div>
+            <div style="text-align:right;color:#e66" id="statFailed">0</div>
+            <div style="color:#586069">已取消</div>
+            <div style="text-align:right;color:#8a949e" id="statCanceled">0</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>批量清理</h3>
+          <div class="field"><button class="btn small" id="deleteSelected" disabled>删除所选</button></div>
+          <div class="field"><button class="btn small" id="deleteSettled">清空已结束（保留出图文件）</button></div>
+          <div class="field"><button class="btn small" id="deleteFailed">删除全部失败/已取消</button></div>
+          <div class="muted-note">删除任务会同时删除它自己生成的图片文件。</div>
+        </section>
+      </details>
+
+    </aside>
+
+    <!-- ============ 任务队列 ============ -->
+    <main>
+      <div class="library-bar">
+        <h2>任务队列</h2>
+        <input type="search" id="search" placeholder="搜索提示词 / 任务号" aria-label="搜索任务">
+        <select id="filter" aria-label="按状态过滤">
+          <option value="">全部状态</option>
+          <option value="pending,running,canceling">未结束</option>
+          <option value="pending">待开始</option>
+          <option value="running,canceling">运行中</option>
+          <option value="done">已完成</option>
+          <option value="failed">失败</option>
+          <option value="canceled">已取消</option>
+        </select>
+        <div class="spacer"></div>
+        <label><input type="checkbox" id="selectAll"> 全选</label>
+        <span id="selectionCount" style="color:#8a949e;font-size:11px">0 项已选</span>
+      </div>
+
+      <div class="library-scroll">
+        <div class="list-header">
+          <div></div>
+          <div class="hdr">#</div>
+          <div class="hdr">模式</div>
+          <div class="hdr">状态</div>
+          <div class="hdr left">提示词 / 结果</div>
+          <div class="hdr">参数</div>
+          <div class="hdr">进度</div>
+          <div class="hdr">↻</div>
+          <div class="hdr">编辑</div>
+          <div class="hdr">开始</div>
+          <div class="hdr">×</div>
+        </div>
+        <div class="list" id="list">
+          <div class="empty"><b>正在读取任务队列</b></div>
+        </div>
+      </div>
+    </main>
+
+  </div>
+
+  <footer>
+    <span class="stat">状态 <b id="statusText">就绪</b></span>
+    <span class="sep">│</span>
+    <span class="stat">暂存 <b id="footStaged">0</b></span>
+    <span class="sep">│</span>
+    <span class="stat">待开始 <b id="footQueue">0</b></span>
+    <span class="sep">│</span>
+    <span class="stat">运行中 <b id="footRunning">0</b></span>
+    <span class="sep">│</span>
+    <span class="stat">已出图 <b id="footDone">0</b></span>
+    <span class="sep">│</span>
+    <span class="stat" id="footCurrent"></span>
+  </footer>
+
+  <dialog id="editDialog" aria-labelledby="editHeading">
+    <form id="editForm" method="dialog">
+      <h2 id="editHeading">编辑任务</h2>
+      <div class="sub" id="editSub"></div>
+      <div class="field">
+        <label for="editPrompt">提示词</label>
+        <textarea id="editPrompt"></textarea>
+      </div>
+      <div class="field">
+        <label for="editNegative">负提示词（可选）</label>
+        <textarea id="editNegative" style="min-height:46px"></textarea>
+      </div>
+      <div class="grid-2">
+        <div class="field">
+          <label for="editSteps">步数</label>
+          <input type="number" id="editSteps" min="1" max="60">
+        </div>
+        <div class="field">
+          <label for="editCfg">引导强度</label>
+          <input type="number" id="editCfg" min="1" max="20" step="0.5">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="field">
+          <label for="editRatio">长宽比</label>
+          <select id="editRatio">
+            <option value="">自动（跟随参考图）</option>
+            <option value="1:1">1:1</option>
+            <option value="4:3">4:3</option>
+            <option value="3:4">3:4</option>
+            <option value="3:2">3:2</option>
+            <option value="2:3">2:3</option>
+            <option value="16:9">16:9</option>
+            <option value="9:16">9:16</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="editN">张数</label>
+          <select id="editN"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="field">
+          <label for="editSeed">Seed（留空 = 随机）</label>
+          <input type="number" id="editSeed" placeholder="随机">
+        </div>
+        <div class="field">
+          <label for="editOutputRes">参考图缩放基准</label>
+          <input type="number" id="editOutputRes" min="256" max="1536" step="16">
+        </div>
+      </div>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:7px;color:#b8bfc6">
+          <input type="checkbox" id="editTransparent"> 透明背景 PNG
+        </label>
+      </div>
+      <div class="field" id="editSeedKeepField" hidden>
+        <label style="display:flex;align-items:center;gap:7px;color:#b8bfc6">
+          <input type="checkbox" id="editKeepSeed" checked> 沿用原 seed（不勾选则重新随机）
+        </label>
+      </div>
+      <div class="field" id="editRefsField" hidden>
+        <label>参考图（不可在此替换）</label>
+        <div class="dialog-refs" id="editRefs"></div>
+      </div>
+      <div class="gen-status" id="editStatus" role="status"></div>
+      <div class="actions">
+        <button type="button" class="tool-btn" id="cancelEdit">取消</button>
+        <button type="button" class="tool-btn primary" id="saveEdit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const POLL_MS = 1500;
+
+    const state = {
+      ready: false,
+      load: "idle",
+      tasks: [],
+      counts: {},
+      autoStart: true,
+      filter: "",
+      search: "",
+      selected: new Set(),
+      editTaskId: null,
+      editFinished: false,
+      lastSignature: "",
+      busy: false,
+    };
+
+    // ============================================================
+    // 工具
+    // ============================================================
+    const STATUS_LABEL = {
+      pending: "待开始", running: "生成中", canceling: "取消中",
+      done: "已完成", failed: "失败", canceled: "已取消",
+    };
+
+    function esc(text) {
+      return String(text == null ? "" : text)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function setStatus(text, cls) {
+      const el = $("statusText");
+      el.textContent = text;
+      el.style.color = cls === "err" ? "#e66" : cls === "ok" ? "#72e68a" : "#8a949e";
+    }
+
+    function setGenStatus(text, cls) {
+      const el = $("genStatus");
+      el.textContent = text;
+      el.className = "gen-status" + (cls ? " " + cls : "");
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return "";
+      const d = new Date(ts * 1000);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    function fmtDur(sec) {
+      if (sec == null) return "";
+      if (sec < 60) return sec.toFixed(1) + "s";
+      const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+      return `${m}分${String(s).padStart(2, "0")}秒`;
+    }
+
+    async function api(path, options) {
+      const res = await fetch(path, options);
+      let body = null;
+      try { body = await res.json(); } catch (e) { body = null; }
+      if (!res.ok) {
+        const detail = body && body.detail
+          ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail))
+          : `HTTP ${res.status}`;
+        throw new Error(detail);
+      }
+      return body;
+    }
+
+    function postJSON(path, payload) {
+      return api(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload || {}),
+      });
+    }
+
+    function readFileAsDataURL(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("读取参考图失败"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // ============================================================
+    // 参考图选择
+    // ============================================================
+    let refFiles = [];
+
+    function renderRefs() {
+      const wrap = $("refs");
+      wrap.innerHTML = "";
+      refFiles.forEach((file, index) => {
+        const cell = document.createElement("div");
+        cell.className = "ref";
+        const img = document.createElement("img");
+        img.src = URL.createObjectURL(file);
+        img.alt = "image" + (index + 1);
+        const badge = document.createElement("span");
+        badge.textContent = "image" + (index + 1);
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "×";
+        del.title = "移除这张参考图";
+        del.addEventListener("click", () => {
+          refFiles.splice(index, 1);
+          renderRefs();
+        });
+        cell.appendChild(img);
+        cell.appendChild(badge);
+        cell.appendChild(del);
+        img.addEventListener("load", () => {
+          // 比例留空(=自动)时画布跟随第一张, 与服务端 ref_index=0 对齐
+          if (index === 0 && !$("genRatio").value && img.naturalWidth && img.naturalHeight) {
+            cell.classList.add("canvas");
+            cell.title = "画布长宽比跟随此图 (ref_index=0)";
+          }
+        });
+        wrap.appendChild(cell);
+      });
+    }
+
+    $("genFiles").addEventListener("change", () => {
+      refFiles = [...$("genFiles").files];
+      if (refFiles.length > 10) {
+        setGenStatus("最多 10 张参考图，已截断到前 10 张", "err");
+        refFiles = refFiles.slice(0, 10);
+      }
+      renderRefs();
+    });
+
+    // ============================================================
+    // 新建任务
+    // ============================================================
+    function splitPrompts() {
+      return $("genPrompt").value
+        .split(/\n\s*\n/)
+        .map((text) => text.trim())
+        .filter(Boolean);
+    }
+
+    function updateCfg() {
+      const value = +$("genCfg").value;
+      $("cfgVal").textContent = value <= 1 ? "1.0（关闭）" : value.toFixed(1) + "（启用 CFG）";
+    }
+
+    function updateSteps() {
+      $("stepsVal").textContent = $("genSteps").value;
+      $("stepsWarn").hidden = +$("genSteps").value >= 20;
+    }
+
+    function updateAutoGenerate() {
+      const auto = $("autoGenerate").checked;
+      $("genBtn").hidden = auto;
+      $("genRunBtn").hidden = !auto;
+      updateQueueHint();
+    }
+
+    function pushAutoGenerate() {
+      // 只在用户真的改了勾选时同步到服务端; 页面加载时不要覆盖已保存的设置
+      postJSON("/api/queue/auto-start", { auto_start: $("autoGenerate").checked })
+        .catch(() => { });
+    }
+
+    function updateQueueHint() {
+      const counts = state.counts || {};
+      const staged = counts.staged || 0;
+      const ready = counts.ready || 0;
+      const running = (counts.running || 0) + (counts.canceling || 0);
+      let text;
+      if ($("autoGenerate").checked) {
+        text = "新增任务会立即进入队列, 按提交顺序串行生成。";
+      } else {
+        text = staged ? `已暂存 ${staged} 条，点「开始队列」统一开始。`
+          : "未勾选时会先暂存，点「开始队列」统一开始。";
+      }
+      if (running) text += ` 当前批次继续生成（运行中 ${running} 条）。`;
+      if (ready) text += ` 待开始 ${ready} 条。`;
+      if (state.load === "loading" && (ready || running)) {
+        text += " 模型加载中，队列会等就绪后自动开始。";
+      }
+      $("queueHint").textContent = text;
+      $("startBatchBtn").disabled = staged === 0 && ready === 0;
+      $("startBatchBtn").textContent = staged ? `开始队列（${staged}）` : "开始队列";
+    }
+
+    function updateReadyUI() {
+      // 模型加载中就允许排队(队列会等就绪), 只有加载失败时才禁止提交
+      const blocked = state.load === "error";
+      $("genBtn").disabled = blocked;
+      $("genRunBtn").disabled = blocked;
+    }
+
+    async function createTasks() {
+      const prompts = splitPrompts();
+      if (!prompts.length) {
+        setGenStatus("请输入提示词", "err");
+        $("genPrompt").focus();
+        return;
+      }
+      const body = {
+        prompts,
+        queue: true,
+        steps: +$("genSteps").value,
+        n: +$("genN").value,
+      };
+      const ratio = $("genRatio").value;
+      if (ratio) body.aspect_ratio = ratio;
+      const negative = $("genNegative").value.trim();
+      if (negative) body.negative_prompt = negative;
+      const cfg = +$("genCfg").value;
+      if (cfg > 1) body.true_cfg_scale = cfg;
+      if ($("genSeed").value !== "") body.seed = +$("genSeed").value;
+      if ($("genTransparent").checked) body.transparent = true;
+
+      const button = $("autoGenerate").checked ? $("genRunBtn") : $("genBtn");
+      button.disabled = true;
+      setGenStatus("提交中…", "gen");
+      try {
+        let path = "/v1/images/generations";
+        if (refFiles.length) {
+          path = "/v1/images/edits/json";
+          body.images = await Promise.all(refFiles.map(readFileAsDataURL));
+          body.ref_index = 0;
+        }
+        const result = await postJSON(path, body);
+        const queued = queuedIds(result);
+        setGenStatus(`已入队 ${queued.length} 条任务`, "ok");
+        $("genPrompt").value = "";
+        refFiles = [];
+        $("genFiles").value = "";
+        renderRefs();
+        $("genSeed").value = "";
+        await refreshTasks(true);
+      } catch (error) {
+        setGenStatus("提交失败：" + error.message, "err");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function queuedIds(result) {
+      if (!result) return [];
+      return (result.data || []).map((item) => item.id).filter(Boolean);
+    }
+
+    // ============================================================
+    // 任务列表
+    // ============================================================
+    function visibleTasks() {
+      const wanted = $("filter").value.split(",").filter(Boolean);
+      const keyword = $("search").value.trim().toLowerCase();
+      return state.tasks.filter((task) => {
+        if (wanted.length && !wanted.includes(task.status)) return false;
+        if (keyword) {
+          const hay = `${task.seq} ${task.prompt} ${task.title || ""}`.toLowerCase();
+          if (!hay.includes(keyword)) return false;
+        }
+        return true;
+      });
+    }
+
+    function paramsLine(task) {
+      const p = task.params || {};
+      const parts = [];
+      const size = p.width && p.height ? `${p.width}×${p.height}` : "跟随参考图";
+      parts.push(size);
+      parts.push(`${p.steps}步`);
+      parts.push(`×${p.n}`);
+      parts.push(`seed ${p.seed != null ? p.seed : "随机"}`);
+      if (p.true_cfg_scale > 1) parts.push(`cfg ${p.true_cfg_scale}`);
+      if (p.output_resolution) parts.push(`分辨率基准 ${p.output_resolution}`);
+      if (task.refs && task.refs.length) parts.push(`参考图 ${task.refs.length} 张`);
+      return parts.join(" · ");
+    }
+
+    function progressCell(task) {
+      if (task.status === "running" || task.status === "canceling") {
+        const total = (task.progress && task.progress.total) || task.params.steps || 0;
+        const step = (task.progress && task.progress.step) || 0;
+        const percent = total ? Math.min(100, Math.round((step / total) * 100)) : 0;
+        const label = task.status === "canceling" ? "取消中…" : `采样 ${step}/${total}`;
+        return `<div class="progress-wrap"><div class="progress-bar"><i style="width:${percent}%"></i></div>`
+          + `<span class="progress-text">${label}</span></div>`;
+      }
+      if (task.status === "done" && task.usage) {
+        const usage = task.usage;
+        return `<span class="clip-meta">用时 ${esc(fmtDur(usage.elapsed_sec))}`
+          + (usage.queue_sec ? ` · 排队 ${esc(fmtDur(usage.queue_sec))}` : "")
+          + (usage.vram_peak_mb ? `<br>峰值 ${usage.vram_peak_mb}MB` : "")
+          + `</span>`;
+      }
+      if (task.status === "failed") return `<span class="clip-error">${esc(task.error || "失败")}</span>`;
+      if (task.status === "canceled") return `<span class="clip-meta">${esc(task.error || "已取消")}</span>`;
+      if (task.staged) return `<span class="clip-meta">暂存中，未开始</span>`;
+      const pos = task.queue_position;
+      return `<span class="clip-meta">${pos ? `排队第 ${pos} 位` : "等待中"}</span>`;
+    }
+
+    function outputsCell(task) {
+      const outputs = task.outputs || [];
+      if (!outputs.length) return "";
+      const thumbs = outputs.slice(0, 4).map((item) =>
+        `<a href="${esc(item.url)}" target="_blank" rel="noreferrer" title="${item.width}×${item.height} seed=${item.seed}">`
+        + `<img src="${esc(item.url)}" loading="lazy" alt="结果"></a>`).join("");
+      const more = outputs.length > 4 ? `<span class="more">+${outputs.length - 4}</span>` : "";
+      return `<div class="outputs">${thumbs}${more}</div>`;
+    }
+
+    function statusBadge(task) {
+      const key = task.staged ? "staged" : task.status;
+      return `<span class="badge-status st-${esc(key)}">${esc(STATUS_LABEL[task.status] || task.status)}</span>`;
+    }
+
+    function rowActions(task) {
+      const busy = task.status === "running" || task.status === "canceling";
+      const retry = `<button class="icon-btn regen" data-act="retry" data-id="${task.id}" `
+        + `title="重新生成（新建一条任务，保留本次结果）">↻</button>`;
+      const edit = `<button class="icon-btn" data-act="edit" data-id="${task.id}" `
+        + `title="${task.status === "pending" ? "编辑提示词与参数" : "改提示词后重新生成"}">✎</button>`;
+      const start = task.status === "pending"
+        ? (task.staged
+          ? `<button class="icon-btn go" data-act="release" data-id="${task.id}" title="开始这条暂存任务">▶</button>`
+          : `<button class="icon-btn" data-act="hold" data-id="${task.id}" title="退回暂存（不会取消正在运行的）">‖</button>`)
+        : "";
+      const cancel = busy
+        ? `<button class="icon-btn del" data-act="cancel" data-id="${task.id}" title="取消（采样步边界生效）">■</button>`
+        : (task.status === "pending"
+          ? `<button class="icon-btn del" data-act="cancel" data-id="${task.id}" title="取消这条未开始的任务">■</button>`
+          : `<button class="icon-btn del" data-act="delete" data-id="${task.id}" title="删除任务及其图片">×</button>`);
+      return { retry, edit, start, cancel };
+    }
+
+    function rowHTML(task) {
+      const actions = rowActions(task);
+      const classes = ["task-row", task.status];
+      if (task.staged) classes.push("staged");
+      const badge = task.status === "running" ? `<span class="row-badge">生成中</span>`
+        : task.staged ? `<span class="row-badge">暂存</span>` : "";
+      const checked = state.selected.has(task.id) ? " checked" : "";
+      const mode = task.kind === "edit" ? "编辑" : "文生图";
+      const title = task.prompt.length > 200 ? task.prompt.slice(0, 200) + "…" : task.prompt;
+      const errorLine = task.status === "failed" && task.error
+        ? `<div class="clip-meta clip-error">${esc(task.error)}</div>` : "";
+      const warnLine = (task.warnings && task.warnings.length)
+        ? `<div class="clip-meta clip-warn" title="${esc(task.warnings.join("\n"))}">⚠ ${esc(task.warnings[0])}</div>` : "";
+      return `<div class="${classes.join(" ")}" data-id="${task.id}">
+        ${badge}
+        <input type="checkbox" class="pick" data-id="${task.id}"${checked} aria-label="选择任务 ${task.seq}">
+        <div class="idx">${task.seq}</div>
+        <div class="kind">${mode}</div>
+        <div class="cell center">${statusBadge(task)}</div>
+        <div class="clip-info">
+          <span class="clip-title" title="${esc(task.prompt)}">${esc(title)}</span>
+          <div class="clip-meta">#${esc(task.id)} · ${esc(fmtTime(task.created_at))}${task.origin ? " · 重跑自 #" + esc(task.origin) : ""}</div>
+          ${outputsCell(task)}
+          ${errorLine}${warnLine}
+        </div>
+        <div class="clip-meta">${esc(paramsLine(task))}</div>
+        <div class="cell">${progressCell(task)}</div>
+        <div class="cell center">${actions.retry}</div>
+        <div class="cell center">${actions.edit}</div>
+        <div class="cell center">${actions.start}</div>
+        <div class="cell center">${actions.cancel}</div>
+      </div>`;
+    }
+
+    function renderList() {
+      const list = $("list");
+      const tasks = visibleTasks();
+      const scrollTop = list.parentElement.scrollTop;
+      if (!tasks.length) {
+        const message = state.tasks.length
+          ? "没有符合筛选条件的任务"
+          : "队列为空：左侧输入提示词后点「+ 暂存任务」或「+ 加入生成队列」";
+        list.innerHTML = `<div class="empty"><b>${esc(message)}</b></div>`;
+      } else {
+        list.innerHTML = tasks.map(rowHTML).join("");
+      }
+      list.parentElement.scrollTop = scrollTop;
+      const total = state.tasks.length;
+      $("selectionCount").textContent = `${state.selected.size} 项已选`;
+      $("selectAll").checked = total > 0 && visibleTasks().every((t) => state.selected.has(t.id));
+      $("deleteSelected").disabled = state.selected.size === 0;
+    }
+
+    function renderStats() {
+      const counts = state.counts || {};
+      const running = (counts.running || 0) + (counts.canceling || 0);
+      $("statStaged").textContent = counts.staged || 0;
+      $("statQueue").textContent = counts.ready || 0;
+      $("statRunning").textContent = running;
+      $("statDone").textContent = counts.done || 0;
+      $("statFailed").textContent = counts.failed || 0;
+      $("statCanceled").textContent = counts.canceled || 0;
+      $("footStaged").textContent = counts.staged || 0;
+      $("footQueue").textContent = counts.ready || 0;
+      $("footRunning").textContent = running;
+      $("footDone").textContent = counts.done || 0;
+      $("ptHint").textContent = `共 ${counts.total || 0} 条`;
+
+      const active = (counts.ready || 0) + running;
+      const indicator = $("queueIndicator");
+      if (active) {
+        const parts = [];
+        if (running) parts.push(`生成 ${running}`);
+        if (counts.ready) parts.push(`待完成 ${counts.ready}`);
+        if (counts.staged) parts.push(`暂存 ${counts.staged}`);
+        indicator.textContent = parts.join(" · ");
+        indicator.classList.add("on");
+      } else {
+        indicator.classList.remove("on");
+      }
+
+      const current = state.tasks.find((t) => t.status === "running" || t.status === "canceling");
+      $("footCurrent").textContent = current
+        ? `正在生成 #${current.seq} · ${(current.prompt || "").slice(0, 40)}`
+        : "";
+      updateQueueHint();
+    }
+
+    function signatureOf(tasks) {
+      return tasks.map((t) => `${t.id}:${t.status}:${t.progress ? t.progress.step : 0}:`
+        + `${(t.outputs || []).length}:${t.queue_position || 0}:${(t.error || "").length}`).join("|");
+    }
+
+    async function refreshTasks(force) {
+      try {
+        const data = await api("/api/tasks");
+        state.tasks = data.tasks || [];
+        state.counts = data.counts || {};
+        const signature = signatureOf(state.tasks);
+        if (force || signature !== state.lastSignature) {
+          state.lastSignature = signature;
+          renderList();
+        }
+        renderStats();
+        state.selected.forEach((id) => {
+          if (!state.tasks.some((t) => t.id === id)) state.selected.delete(id);
+        });
+      } catch (error) {
+        setStatus("读取队列失败：" + error.message, "err");
+      }
+    }
+
+    // ============================================================
+    // 行内操作
+    // ============================================================
+    async function taskAction(taskId, action) {
+      if (state.busy) return;
+      state.busy = true;
+      try {
+        if (action === "retry") {
+          const created = await postJSON(`/api/tasks/${taskId}/retry`, {});
+          setStatus(`已按原参数新建任务 #${created.seq}`, "ok");
+        } else if (action === "cancel") {
+          await postJSON(`/api/tasks/${taskId}/cancel`, {});
+          setStatus("已请求取消（运行中任务会在当前采样步结束后停止）", "ok");
+        } else if (action === "release" || action === "hold") {
+          await postJSON(`/api/tasks/${taskId}/${action}`, {});
+          setStatus(action === "release" ? "已开始这条任务" : "已退回暂存", "ok");
+        } else if (action === "delete") {
+          const task = state.tasks.find((t) => t.id === taskId);
+          const label = task ? `#${task.seq} 《${(task.prompt || "").slice(0, 20)}》` : taskId;
+          if (!confirm(`删除任务 ${label} 及其生成的图片文件？`)) return;
+          await api(`/api/tasks/${taskId}`, { method: "DELETE" });
+          state.selected.delete(taskId);
+          setStatus("已删除", "ok");
+        }
+      } catch (error) {
+        setStatus("操作失败：" + error.message, "err");
+      } finally {
+        state.busy = false;
+        await refreshTasks(true);
+      }
+    }
+
+    $("list").addEventListener("click", (event) => {
+      const pick = event.target.closest(".pick");
+      if (pick) {
+        if (pick.checked) state.selected.add(pick.dataset.id);
+        else state.selected.delete(pick.dataset.id);
+        renderList();
+        return;
+      }
+      const button = event.target.closest("button[data-act]");
+      if (button) {
+        taskAction(button.dataset.id, button.dataset.act);
+        return;
+      }
+      const row = event.target.closest(".task-row");
+      if (row) openEditor(row.dataset.id);
+    });
+
+    $("selectAll").addEventListener("change", (event) => {
+      const tasks = visibleTasks();
+      if (event.target.checked) tasks.forEach((t) => state.selected.add(t.id));
+      else tasks.forEach((t) => state.selected.delete(t.id));
+      renderList();
+    });
+
+    $("filter").addEventListener("change", renderList);
+    $("search").addEventListener("input", renderList);
+
+    // ============================================================
+    // 编辑弹窗
+    // ============================================================
+    function openEditor(taskId) {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (!task) return;
+      if (task.status === "running" || task.status === "canceling") {
+        setStatus("任务正在生成，请先取消再编辑", "err");
+        return;
+      }
+      state.editTaskId = taskId;
+      state.editFinished = task.status !== "pending";
+      const p = task.params || {};
+      $("editHeading").textContent = state.editFinished
+        ? `重新生成（源任务 #${task.seq}）`
+        : `编辑任务 #${task.seq}`;
+      $("editSub").innerHTML = state.editFinished
+        ? "保存会按修改后的参数<b>新建一条任务</b>，原结果保留便于对比。"
+        : "保存后按新参数生成；任务尚未开始，不会消耗算力。";
+      $("editPrompt").value = task.prompt || "";
+      $("editNegative").value = task.negative_prompt || "";
+      $("editSteps").value = p.steps || 30;
+      $("editCfg").value = p.true_cfg_scale || 1;
+      $("editRatio").value = ratioOf(p);
+      $("editN").value = p.n || 1;
+      $("editSeed").value = p.seed != null ? p.seed : "";
+      $("editOutputRes").value = p.output_resolution || "";
+      $("editTransparent").checked = !!p.transparent;
+      $("editSeedKeepField").hidden = !state.editFinished;
+      $("editKeepSeed").checked = true;
+      $("editRefsField").hidden = !(task.refs && task.refs.length);
+      $("editRefs").innerHTML = (task.refs || []).map((name) =>
+        `<img src="/api/tasks/${task.id}/refs/${encodeURIComponent(name)}" alt="${esc(name)}">`).join("");
+      $("editStatus").textContent = "";
+      $("editDialog").showModal();
+      $("editPrompt").focus();
+    }
+
+    function ratioOf(params) {
+      const ratio = { "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "3:2": [3, 2],
+        "2:3": [2, 3], "16:9": [16, 9], "9:16": [9, 16] };
+      if (params.aspect_ratio && ratio[params.aspect_ratio]) return params.aspect_ratio;
+      if (params.width && params.height) {
+        const value = params.width / params.height;
+        for (const key of Object.keys(ratio)) {
+          const [a, b] = ratio[key];
+          if (Math.abs(value - a / b) < 0.02) return key;
+        }
+      }
+      return "";
+    }
+
+    async function saveEditor() {
+      const taskId = state.editTaskId;
+      if (!taskId) return;
+      const prompt = $("editPrompt").value.trim();
+      if (!prompt) {
+        $("editStatus").textContent = "提示词不能为空";
+        $("editStatus").className = "gen-status err";
+        return;
+      }
+      const payload = {
+        prompt,
+        negative_prompt: $("editNegative").value.trim() || null,
+        steps: +$("editSteps").value,
+        true_cfg_scale: +$("editCfg").value,
+        aspect_ratio: $("editRatio").value,
+        n: +$("editN").value,
+        transparent: $("editTransparent").checked,
+      };
+      const seed = $("editSeed").value;
+      const keepSeed = !state.editFinished || $("editKeepSeed").checked;
+      if (seed !== "" && keepSeed) payload.seed = +seed;
+      else if (state.editFinished) payload.keep_seed = false;
+      if ($("editOutputRes").value !== "") payload.output_resolution = +$("editOutputRes").value;
+
+      $("saveEdit").disabled = true;
+      $("editStatus").textContent = "保存中…";
+      $("editStatus").className = "gen-status gen";
+      try {
+        if (state.editFinished) {
+          const created = await postJSON(`/api/tasks/${taskId}/retry`, payload);
+          setStatus(`已按修改后的参数新建任务 #${created.seq}`, "ok");
+        } else {
+          await api(`/api/tasks/${taskId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          setStatus("任务参数已更新", "ok");
+        }
+        $("editDialog").close();
+        state.editTaskId = null;
+        await refreshTasks(true);
+      } catch (error) {
+        $("editStatus").textContent = "保存失败：" + error.message;
+        $("editStatus").className = "gen-status err";
+      } finally {
+        $("saveEdit").disabled = false;
+      }
+    }
+
+    $("saveEdit").addEventListener("click", saveEditor);
+    $("cancelEdit").addEventListener("click", () => {
+      $("editDialog").close();
+      state.editTaskId = null;
+    });
+
+    // ============================================================
+    // 批量清理
+    // ============================================================
+    $("deleteSelected").addEventListener("click", async () => {
+      const ids = [...state.selected];
+      if (!ids.length) return;
+      if (!confirm(`删除所选 ${ids.length} 条任务及其生成的图片文件？`)) return;
+      try {
+        const result = await postJSON("/api/queue/delete", { ids });
+        const skipped = (result.skipped || []).length;
+        setStatus(`已删除 ${result.deleted.length} 条` + (skipped ? `，${skipped} 条跳过（运行中）` : ""), "ok");
+        state.selected.clear();
+      } catch (error) {
+        setStatus("删除失败：" + error.message, "err");
+      }
+      await refreshTasks(true);
+    });
+
+    async function deleteByStatus(statuses, label) {
+      const targets = state.tasks.filter((t) => statuses.includes(t.status));
+      if (!targets.length) {
+        setStatus(`没有${label}的任务`, "err");
+        return;
+      }
+      if (!confirm(`删除 ${targets.length} 条${label}的任务？会同时删除它们生成的图片。`)) return;
+      try {
+        const result = await postJSON("/api/queue/delete", { ids: targets.map((t) => t.id) });
+        const skipped = (result.skipped || []).length;
+        setStatus(`已删除 ${result.deleted.length} 条` + (skipped ? `，${skipped} 条跳过` : ""), "ok");
+      } catch (error) {
+        setStatus("清理失败：" + error.message, "err");
+      }
+      await refreshTasks(true);
+    }
+
+    $("deleteSettled").addEventListener("click", () =>
+      deleteByStatus(["done", "failed", "canceled"], "已结束"));
+    $("deleteFailed").addEventListener("click", () =>
+      deleteByStatus(["failed", "canceled"], "失败/已取消"));
+
+    // ============================================================
+    // 健康检查与轮询
+    // ============================================================
+    async function pollHealth() {
+      try {
+        const health = await api("/health");
+        state.load = health.load;
+        state.ready = health.load === "ready";
+        $("loadDot").className = "dot " + (health.load === "ready" ? "ok"
+          : health.load === "loading" ? "warn" : health.load === "error" ? "err" : "");
+        $("loadText").textContent = health.load === "ready" ? "就绪"
+          : health.load === "loading" ? "模型加载中…" : health.load === "error" ? "加载出错" : "空闲";
+        $("vramPill").innerHTML = health.vram
+          ? `显存 <b>${health.vram.used_mb}</b> / ${health.vram.total_mb} MB`
+          : "显存 –";
+        $("modelPill").title = `${health.gpu || "CPU"} · 队列 ${health.queue ? health.queue.ready : 0} 条待开始`;
+        if (health.load === "error") {
+          setStatus("模型加载失败：" + (health.error || "未知错误"), "err");
+        }
+        updateReadyUI();
+        updateQueueHint();
+      } catch (error) {
+        $("loadDot").className = "dot err";
+        $("loadText").textContent = "服务未连接";
+        setStatus("服务未连接", "err");
+      }
+    }
+
+    let polling = false;
+    async function tick() {
+      if (polling) return;
+      polling = true;
+      try {
+        await Promise.all([pollHealth(), refreshTasks(false)]);
+      } finally {
+        polling = false;
+      }
+    }
+
+    // 服务端保存的「加入后自动生成」是权威设置, 首次加载时同步界面(之后不再覆盖)
+    async function loadServerPrefs() {
+      try {
+        const data = await api("/api/queue");
+        state.autoStart = data.auto_start !== false;
+        $("autoGenerate").checked = state.autoStart;
+        updateAutoGenerate();
+      } catch (error) { /* 读不到就沿用界面默认 */ }
+    }
+
+    $("genBtn").addEventListener("click", createTasks);
+    $("genRunBtn").addEventListener("click", createTasks);
+    $("refreshBtn").addEventListener("click", async () => {
+      await tick();
+      setStatus("已刷新", "ok");
+    });
+    $("startBatchBtn").addEventListener("click", async () => {
+      try {
+        const result = await postJSON("/api/queue/release-all", {});
+        setStatus(`已释放 ${result.released.length} 条暂存任务`, "ok");
+        $("autoGenerate").checked = true;
+        updateAutoGenerate();
+      } catch (error) {
+        setStatus("开始队列失败：" + error.message, "err");
+      }
+      await refreshTasks(true);
+    });
+
+    $("autoGenerate").addEventListener("change", () => {
+      updateAutoGenerate();
+      pushAutoGenerate();
+    });
+    $("genCfg").addEventListener("input", updateCfg);
+    $("genSteps").addEventListener("input", updateSteps);
+    $("genRatio").addEventListener("change", renderRefs);
+    $("genPrompt").addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        createTasks();
       }
     });
-  });
-}
 
-function updateCfg() {
-  const v = +$('cfg').value;
-  $('cfgVal').textContent = v <= 1 ? '1.0（关闭）' : v.toFixed(1) + '（启用 CFG）';
-}
-
-function toDataURL(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result);
-    r.onerror = rej;
-    r.readAsDataURL(file);
-  });
-}
-
-async function generate() {
-  clearMsg();
-  showWarn(null);
-  const prompt = $('prompt').value.trim();
-  if (!prompt) { show('err', '请输入提示词'); return; }
-
-  const cfg = +$('cfg').value;
-  const body = {
-    prompt,
-    steps: +$('steps').value,
-    aspect_ratio: $('ratio').value || undefined,   // 自动=不传(文生图 1:1 / 编辑跟随参考图)
-    n: +$('n').value,
-    response_format: 'url',
-  };
-  const neg = $('negative_prompt').value.trim();
-  if (neg) body.negative_prompt = neg;
-  // 1.0 是管线默认值(无引导), 不传以免噪声; >1 才真正启用 CFG
-  if (cfg > 1) body.true_cfg_scale = cfg;
-  if ($('seed').value !== '') body.seed = +$('seed').value;
-  if ($('transparent').checked) body.transparent = true;
-
-  const files = [...$('files').files];
-  let url = '/v1/images/generations';
-  if (files.length) {
-    url = '/v1/images/edits';
-    body.images = await Promise.all(files.map(toDataURL));
-    // 比例留空时统一以 image1 定画布, 与服务端默认 ref_index=0 对齐, 避免多图比例不一致
-    body.ref_index = 0;
-  }
-
-  const btn = $('go');
-  btn.disabled = true;
-  btn.textContent = '生成中…';
-  const t0 = Date.now();
-  $('timer').textContent = '生成中 0 秒（首张含预热会更久）';
-  timerId = setInterval(() => {
-    $('timer').textContent = '生成中 ' + Math.round((Date.now() - t0) / 1000) + ' 秒（首张含预热会更久）';
-  }, 500);
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (j.detail || JSON.stringify(j)));
-    render(j);
-    showWarn(j.usage.warnings);
-    show('info', `完成：用时 ${j.usage.elapsed_sec}s，排队 ${j.usage.queue_sec}s，`
-       + `显存峰值 ${j.usage.vram_peak_mb}MB`
-       + `，引导 ${j.usage.true_cfg_scale}${j.usage.true_cfg_scale > 1 ? '(CFG)' : '(无)'}`
-       + (j.usage.mem_avail_gb != null ? `，可用内存 ${j.usage.mem_avail_gb}GB` : ''));
-  } catch (e) {
-    show('err', '生成失败：' + e.message);
-  } finally {
-    clearInterval(timerId); timerId = null; $('timer').textContent = '';
-    if (ready) { btn.disabled = false; btn.textContent = '生成'; }
-  }
-}
-
-function render(j) {
-  $('empty').style.display = 'none';
-  $('result').style.display = 'block';
-  $('imgs').innerHTML = j.data.map(d =>
-    `<img class="preview" src="${d.url}" loading="lazy" alt="生成结果">`).join('');
-  $('meta').innerHTML = j.data.map(d =>
-    `<span>尺寸 <b>${d.width}×${d.height}</b></span>`
-    + `<span>seed <b>${d.seed}</b></span>`
-    + `<span>步数 <b>${d.steps}</b></span>`).join('');
-  $('usage').innerHTML =
-      `<span>耗时 <b>${j.usage.elapsed_sec}s</b></span>`
-    + `<span>排队 <b>${j.usage.queue_sec}s</b></span>`
-    + `<span>显存峰值 <b>${j.usage.vram_peak_mb}MB</b></span>`
-    + `<span>引导强度 <b>${j.usage.true_cfg_scale}</b></span>`
-    + (j.usage.ref_images ? `<span>参考图 <b>${j.usage.ref_images} 张</b></span>` : '')
-    + (j.usage.mem_avail_gb != null ? `<span>可用内存 <b>${j.usage.mem_avail_gb}GB</b></span>` : '');
-
-  const g = $('gallery');
-  $('galleryWrap').style.display = 'block';
-  j.data.forEach(d => {
-    const a = document.createElement('a');
-    a.href = d.url; a.target = '_blank';
-    const img = document.createElement('img');
-    img.src = d.url; img.loading = 'lazy';
-    img.title = `${d.width}×${d.height} seed=${d.seed}`;
-    a.appendChild(img);
-    g.prepend(a);
-  });
-}
-
-function updateSteps() {
-  $('stepsVal').textContent = $('steps').value;
-  $('stepsWarn').style.display = +$('steps').value < 20 ? 'block' : 'none';
-}
-$('steps').addEventListener('input', updateSteps);
-updateSteps();
-$('cfg').addEventListener('input', updateCfg);
-updateCfg();
-$('files').addEventListener('change', renderRefs);
-$('ratio').addEventListener('change', renderRefs);
-renderRefs();
-$('go').addEventListener('click', generate);
-pollHealth();
-setInterval(pollHealth, 2500);
-</script>
+    updateCfg();
+    updateSteps();
+    updateAutoGenerate();
+    renderRefs();
+    setStatus("就绪");
+    loadServerPrefs().then(tick);
+    setInterval(tick, POLL_MS);
+  </script>
 </body>
+
 </html>

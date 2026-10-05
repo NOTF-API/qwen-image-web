@@ -20,13 +20,20 @@
 
 ```
 qwen-image/
-├─ server.py              服务端 (FastAPI)
+├─ server.py              服务端 (FastAPI) ＋ 队列 API
+├─ taskqueue.py           持久化任务队列 (tasks.json + 单工作线程 + 采样步级取消)
 ├─ start.bat              启动入口
-├─ static/index.html      Web 使用页面 (GET / 直接返回)
+├─ static/index.html      Web 生图工作台 (GET / 直接返回)
 ├─ model/                 模型权重 (scripts/download_model.ps1 下载)
 ├─ outputs/               生成的图片
+│  └─ tasks/              任务队列落盘目录: tasks.json + refs/<任务ID>/参考图
 ├─ examples/client.mjs    JS 调用示例
 ├─ scripts/download_model.ps1   模型下载脚本 (可断点续传)
+├─ scripts/test_taskqueue.py    队列离线自测 (假生成, 秒级)
+├─ scripts/test_server_queue.py 队列 HTTP 冒烟测试 (临时输出目录, 不加载模型)
+├─ scripts/test_queue_gpu.py    队列 + 真模型集成测试 (需要 GPU)
+├─ scripts/test_queue_loading.py 模型加载期入队测试 (需要 GPU)
+├─ scripts/check_web.py   Web 页面内联脚本静态检查 (id 引用/接口路径)
 ├─ wheels/                torch/torchvision 本地 wheel (cu128)
 └─ venv/                  Python 3.11 虚拟环境
 ```
@@ -48,8 +55,10 @@ start.bat
 跳过菜单直接指定：`start.bat Q5_K_S`（等价 `powershell -File start.ps1 Q5_K_S`，支持部分匹配如 `Q4`）。
 也可以手动设 `QWEN_GGUF` 环境变量后 `python -u server.py`。
 
-启动后浏览器打开 **http://127.0.0.1:8091/** 即为可视化使用页面（提示词/长宽比/步数/
-seed/张数/透明背景/引导强度/参考图上传，带加载状态、耗时统计与会话画廊）；纯 API 调用见下文。
+启动后浏览器打开 **http://127.0.0.1:8091/** 即为**生图工作台**（左侧建任务：提示词/长宽比/
+步数/seed/张数/透明背景/引导强度/参考图上传；右侧任务队列：暂存、开始、取消、编辑提示词、
+重新生成、删除，以及每条的进度、耗时与出图缩览）。任务会落盘，**重启服务后仍在**，可继续
+编辑、重新生成或删除。纯 API 调用见下文。
 
 首次启动会在后台预加载模型（**实测冷启动 110~120 秒**），`/health` 显示
 `load: loading -> ready`。之后每次生成（RTX 5060 Ti 8GB 实测）：
@@ -165,9 +174,61 @@ diffusers 管线按 `output_resolution`（默认 1024）把每张参考图等比
 
 （实测：首次编辑含视觉编码器预热约 130~190 秒，显存峰值 **8124~8378 MB**——贴近 8GB 上限，建议编辑时不要同时开占显存的程序。编辑路径**始终使用 VAE 分块解码**（auto 策略下不分块会 OOM，2026-09-27 实测 500）。）
 
-### 3. 其它
+### 3. 任务队列（Web 工作台用）
 
-- `GET /health` — 加载状态 / 显存 / 排队数
+GPU 只有一张，队列把生成串行化：**提交即返回**，出图在后台按提交顺序一条条跑，
+进度、取消、编辑、重跑、删除都通过下列接口完成。
+
+| 接口 | 作用 |
+|---|---|
+| `POST /v1/images/generations` + `queue: true` | 入队文生图任务，立即返回任务号（不占用 HTTP 连接等 GPU） |
+| `POST /v1/images/generations` + `prompts: [...]` | 一次把多条提示词拆成多条任务（最多 `QWEN_MAX_QUEUE_BATCH`，默认 16） |
+| `POST /v1/images/edits/json` | 图生图/编辑入队；`images` 可为 base64、data URL 或本站 `/outputs/xxx.png` 路径 |
+| `GET /api/queue` | 队列计数、当前任务、参数上限（步数/参考图数/长宽比表） |
+| `GET /api/tasks?status=pending&limit=50` | 任务列表（未结束在前按提交顺序，已结束在后按完成时间倒序） |
+| `GET /api/tasks/{id}` | 单条任务详情（参数、进度、产物、耗时、显存峰值） |
+| `PATCH /api/tasks/{id}` | 编辑**未开始**任务的提示词与参数（运行中/已结束返回 409） |
+| `POST /api/tasks/{id}/cancel` | 取消：未开始立即取消；运行中在当前**采样步边界**停止（秒级） |
+| `POST /api/tasks/{id}/retry` | 按原参数**新建**一条任务（历史结果保留，便于对比同提示词不同出图） |
+| `POST /api/tasks/{id}/release` / `/hold` | 单条任务「开始」/「退回暂存」 |
+| `POST /api/queue/release-all` | 开始全部暂存任务 |
+| `POST /api/queue/auto-start` `{auto_start}` | 开关「加入后自动生成」；开启时顺带释放已暂存任务 |
+| `DELETE /api/tasks/{id}` / `POST /api/queue/delete` `{ids:[...]}` | 删除任务及其图片文件（运行中的拒绝删除，返回 409） |
+| `GET /api/tasks/{id}/refs/{name}` | 取回任务落盘的参考图 |
+
+任务状态：`pending`（待开始）→ `running` → `done` / `failed` / `canceled`，
+运行中请求取消会短暂进入 `canceling`。
+
+```jsonc
+// 入队一次, 之后用任务号轮询
+const q = await (await fetch("http://127.0.0.1:8091/v1/images/generations", {
+  method: "POST", headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ prompt: "雨夜霓虹招牌", steps: 30, queue: true }),
+})).json();
+const id = q.data[0].id;                       // 202/200 + {queued:1, data:[{id,status,queue_position}]}
+
+// 轮询: GET /api/tasks/{id} -> status/progress/outputs[].url
+// 改提示词后重跑: POST /api/tasks/{id}/retry  {prompt: "改成清晨"}
+// 不要了:        DELETE /api/tasks/{id}       （运行中先 POST /cancel）
+```
+
+行为与持久化细节：
+
+- 队列状态落盘在 `outputs/tasks/tasks.json`（原子写入），**重启后任务列表与产物都在**；
+  上次退出时正在运行的任务会自动重新排队（最多 `QWEN_TASK_MAX_ATTEMPTS` 次，默认 2）。
+- 参考图会复制到 `outputs/tasks/refs/<任务ID>/`，所以重跑/重启后参数与参考图完整可复用。
+- 取消是**真取消**：借助 diffusers 的 `callback_on_step_end` 在每个采样步检查标记并中断，
+  不会留下半成品图片（30 步约 3 秒/步，取消通常数秒内生效）。
+- 同步接口保持原样：不传 `queue` / `prompts` 时 `POST /v1/images/generations` 仍然阻塞到出图
+  （OpenAI 风格兼容），两种用法可共存。
+- 已结束任务的记录上限 `QWEN_TASK_MAX_KEEP`（默认 500），超出后从最旧的开始清理并删除其图片。
+- `outputs/` 里**没有被任何任务引用**的 PNG 默认**不删**（队列接管之前的老图、
+  手工放进去的图都保留）。想清理「生成到一半被强杀」留下的半成品，可设
+  `QWEN_TASK_CLEAN_ORPHANS=1`：启动后只清理比队列都新、且无任务引用的 PNG。
+
+### 4. 其它
+
+- `GET /health` — 加载状态 / 显存 / 队列计数 / 当前任务
 - `GET /v1/models` — OpenAI 兼容模型列表
 - `GET /docs` — Swagger 交互式文档
 
@@ -208,6 +269,14 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 | `QWEN_GGUF` | 自动选 Q4_K_M | 换量化档位，如 `qwen-image-2.1-Q5_K_M.gguf` |
 | `QWEN_VAE_TILING` | auto | VAE 分块解码：`auto`=编辑/长边>1024 自动开，文生图≤1024 关（消除 192px 分块接缝网格，实测省 13s）；`1`=恒开（有接缝）；`0`=恒关（编辑/大图会 OOM） |
 | `QWEN_MODEL_DIR` | `./model` | 模型目录 |
+| `QWEN_OUTPUT_DIR` | `./outputs` | 出图目录（队列的 `tasks/` 也放在这里） |
+| `QWEN_TASK_DIR` | `$QWEN_OUTPUT_DIR/tasks` | 任务队列落盘目录 |
+| `QWEN_QUEUE_AUTOSTART` | 1 | 首次启动时「加入后自动生成」的默认开关（之后以界面上的勾选为准） |
+| `QWEN_MAX_QUEUE_BATCH` | 16 | 一次 `prompts` 批量提交的任务数上限 |
+| `QWEN_MAX_REF_IMAGES` | 10 | 参考图数量上限（官方上限 10 张） |
+| `QWEN_TASK_MAX_ATTEMPTS` | 2 | 进程中断后自动重新排队的最大尝试次数，超过则标记失败 |
+| `QWEN_TASK_MAX_KEEP` | 500 | 已结束任务的保留条数上限，超出清理最旧的（含其图片） |
+| `QWEN_TASK_CLEAN_ORPHANS` | 0（关闭） | 设 `1` 时启动后清理「比队列都新且无任务引用」的 PNG（半成品）。默认关闭，避免误删老图 |
 | `QWEN_MIN_MEM_GB` | 0（关闭） | 可选：按**提交余量**（Windows GlobalMemoryStatusEx）拦截，余量低于此 GB 数时 503，防 4.4GB 权重搬移触发原生崩溃。正常运行余量约 6~7GB，建议 `5`；`0`=关闭 |
 
 **尺寸换算（实测）**：8GB 卡下 1024×1024@30步 ≈ 98s（auto 分块关）；16:9(1024×576)@30步 ≈ 49s；
@@ -218,6 +287,24 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 - 透明图：`transparent: true` 自动套官方推荐句式（或在 prompt 里写
   "This is an RGBA image with transparency. ..."）
 - 长宽比：官方 2K 比例表 1:1 / 4:3 / 3:4 / 3:2 / 2:3 / 16:9 / 9:16 都支持
+
+## 测试
+
+```powershell
+# 队列逻辑离线自测（假生成，秒级；入队/取消/重跑/删除/重启恢复）
+venv\Scripts\python.exe scripts\test_taskqueue.py
+
+# 队列 HTTP 冒烟测试（起临时服务实例 + 临时输出目录，不加载模型）
+venv\Scripts\python.exe scripts\test_server_queue.py
+
+# 队列 + 真模型集成测试（需要 GPU/模型，约 3~6 分钟：真出图、真取消、重启后重跑）
+venv\Scripts\python.exe scripts\test_queue_gpu.py
+
+# 模型加载期间入队（需要 GPU，约 1 分钟：任务不失败，就绪后自动开始）
+venv\Scripts\python.exe scripts\test_queue_loading.py
+```
+
+前两个脚本不碰 `outputs/` 与真实模型，可随时跑；后两个会占用 GPU。
 
 ## 模型与依赖重装（全国内镜像）
 
@@ -253,6 +340,10 @@ torch wheel 来源（37MB/s）：`https://mirror.sjtu.edu.cn/pytorch-wheels/cu12
 | 服务进程崩溃(access violation / 闪退) | 多为内存·显存被其他进程挤占（2026-09-26 实测：外部进程占 4.5GB 显存 + 可用内存 1.7GB 时，TE 搬回 CPU 触发 0xc0000005）。保持 4GB+ 可用内存；`faulthandler` 会把崩溃时的 C 栈打到控制台 |
 | 想要更高画质 | 启动时选 `Q5_K_M`/`Q5_K_S`（见上文「启动」），或设 `QWEN_GGUF=qwen-image-2.1-Q5_K_M.gguf`；两档显存峰值都在 ~6.4GB（以 `/health` 的 `vram_peak_mb` 为准）。**注意**：Q5_K_M 搬运需 5GB 提交内存，16GB 内存机器连续生成可能在第 2 张触发原生崩溃（2026-09-27 插桩实测：解码前提交余量仅剩 1.25GB < 需求 4.99GB）；加内存到 32GB 后余量充足即无此问题 |
 | 出图有规则网格纹 | 分两类：①**低步数**（<12）的细网格是模型非蒸馏特性，加步数到 20~40；②**高步数残留的淡线**是 VAE 分块解码接缝（每 192px 一条，1024² 正好 5×5），默认 `QWEN_VAE_TILING=auto` 已在文生图 ≤1024 自动关闭。与量化档位无关（Q4/Q5 实测同样表现），同 seed 开关分块差值仅 ~0.5/255 灰阶。完整排查过程见 `docs/grid-artifact-fix.md` |
+| 取消后还在跑 | 取消在**采样步边界**生效：当前步跑完才中断（30 步约 3 秒/步），界面会显示「取消中…」。进程被强杀除外——那属于中断，重启后任务会自动重新排队 |
+| 任务一直「待开始」 | 看是否关掉了「加入后自动生成」（此时是暂存态，需点「开始队列」），以及是否已有任务在运行（单卡串行，一条接一条） |
+| 重启后老任务变成失败 | 该任务在上次退出时正在运行，且已用满 `QWEN_TASK_MAX_ATTEMPTS`（默认 2）次自动重试；用「重新生成」即可再跑一条 |
+| 队列出图想手工留存 | 直接下载 `outputs/xxx.png`；注意删除任务会连带删除它的图片文件（仍被其他任务引用的不会被删） |
 
 ## 许可
 

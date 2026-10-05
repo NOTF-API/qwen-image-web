@@ -13,6 +13,7 @@ import os
 import sys
 import gc
 import io
+import json
 import time
 import uuid
 import base64
@@ -21,6 +22,7 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 # ---- 环境变量必须在 import torch 之前设置 ----
 # 注: expandable_segments 在 Windows 上不受支持(torch 会警告并忽略), 故不设置
@@ -32,8 +34,17 @@ import faulthandler
 faulthandler.enable()
 
 BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR))
+
+from taskqueue import (                                    # noqa: E402
+    Canceled, QueueWorker, TaskConflict, TaskNotFound, TaskStore,
+    cleanup_orphan_outputs,
+)
+
 MODEL_DIR = Path(os.environ.get("QWEN_MODEL_DIR", BASE_DIR / "model"))
 OUTPUT_DIR = Path(os.environ.get("QWEN_OUTPUT_DIR", BASE_DIR / "outputs"))
+# 任务队列的持久化目录: <outputs>/tasks/{tasks.json, refs/<task_id>/*}
+TASK_DIR = Path(os.environ.get("QWEN_TASK_DIR", OUTPUT_DIR / "tasks"))
 HOST = os.environ.get("QWEN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("QWEN_PORT", "8091"))
 MAX_SIDE = int(os.environ.get("QWEN_MAX_SIDE", "1536"))          # 单边上限(8GB 显存)
@@ -42,7 +53,7 @@ DEFAULT_STEPS = int(os.environ.get("QWEN_STEPS", "30"))          # 默认采样�
 MAX_STEPS = int(os.environ.get("QWEN_MAX_STEPS", "60"))
 # 真 CFG 开关: Qwen-Image-2.1 官方按「无引导」采样, 管线默认 true_cfg_scale=1.0(关闭)。
 # >1 时才启用 CFG, 且必须同时给 negative_prompt, 两者缺一则负提示词被忽略(管线只发警告)。
-# 注意: 本项目此前暴露的 guidance_scale 并非本管线参数, 会被静默丢弃(已删除, 见 _generate)。
+# 注意: 本项目此前暴露的 guidance_scale 并非本管线参数, 会被静默丢弃(已删除, 见 _build_plan)。
 DEFAULT_TRUE_CFG_SCALE = float(os.environ.get("QWEN_TRUE_CFG_SCALE", "1.0"))
 MAX_TRUE_CFG_SCALE = float(os.environ.get("QWEN_MAX_TRUE_CFG_SCALE", "20"))
 # 参考图缩放基准(output_resolution): 管线按此值把每张参考图等比缩到长边上限,
@@ -55,6 +66,8 @@ OUTPUT_RESOLUTION = int(os.environ.get("QWEN_OUTPUT_RESOLUTION", "0")) or None
 EDIT_DEFAULT_OUTPUT_RESOLUTION = int(os.environ.get("QWEN_EDIT_OUTPUT_RESOLUTION", "1024"))
 # 多参考图时按第几张定画布长宽比(管线内部用最后一张, 本案默认第一张, 即内容/主体图)
 REF_IMAGE_INDEX = int(os.environ.get("QWEN_REF_INDEX", "0"))
+MAX_REF_IMAGES = int(os.environ.get("QWEN_MAX_REF_IMAGES", "10"))   # 官方上限 10 张
+MAX_QUEUE_BATCH = int(os.environ.get("QWEN_MAX_QUEUE_BATCH", "16"))  # 一次 prompts 批量上限
 OFFLOAD = os.environ.get("QWEN_OFFLOAD", "model")                # model | sequential
 GGUF_FILE = os.environ.get("QWEN_GGUF", "")                      # 指定 transformer/*.gguf
 MIN_MEM_GB = float(os.environ.get("QWEN_MIN_MEM_GB", "0"))       # 可用内存下限(GB), 低于则503; 默认0=关闭(实测该指标无法可靠预判崩溃)
@@ -102,6 +115,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("qwen-image")
 
+# ---- 任务队列: 持久化存储(任务列表/参数/产物) + 单线程串行执行 ----
+TASK_STORE = TaskStore(TASK_DIR)
+QUEUE: "QueueWorker | None" = None
+_PIPE_CALL_PARAMS: "set | None" = None      # pipeline.__call__ 的可用参数(懒加载缓存)
+
 # 官方推荐的长宽比 -> 尺寸表 (在长边缩放后按 16 的倍数取整)
 ASPECT_RATIOS = {
     "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4), "3:2": (3, 2),
@@ -112,6 +130,7 @@ ASPECT_RATIOS = {
 PIPE = None
 LOAD_LOCK = threading.Lock()
 GEN_LOCK = threading.Lock()          # GPU 串行化: 并发请求排队
+# waiting: 正在等待 GPU 的请求数(同步接口 + 队列工作线程共用)
 STATE = {"load": "idle", "error": None, "loaded_at": None, "waiting": 0,
          "last_gen": None}
 
@@ -303,6 +322,30 @@ def _b64_to_pil(data: str):
     return img
 
 
+def _ref_source_to_pil(src: str):
+    """参考图来源: base64 / data URL / 本站产物路径(/outputs/xxx.png 或绝对路径)。"""
+    if not isinstance(src, str) or not src.strip():
+        raise ValueError("参考图需为 base64 字符串或本站图片路径")
+    s = src.strip()
+    if s.startswith("data:") or len(s) > 256:
+        return _b64_to_pil(s)
+    if s.startswith(("http://", "https://")):
+        # 只允许指回本站的产物, 避免服务被当成任意 URL 抓取器
+        if "/outputs/" not in s:
+            raise ValueError("只支持本站 /outputs/ 下的图片 URL")
+        s = s.split("/outputs/", 1)[1]
+    name = Path(s).name
+    path = (OUTPUT_DIR / name).resolve()
+    if path.parent != OUTPUT_DIR.resolve() or not path.is_file():
+        raise ValueError(f"找不到本站图片: {name}")
+    from PIL import Image
+    img = Image.open(path)
+    img.load()
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.mode or "P" in img.mode else "RGB")
+    return img
+
+
 def _wrap_transparency(prompt: str, transparent: bool) -> str:
     if not transparent:
         return prompt
@@ -320,16 +363,15 @@ def _filter_kwargs(fn, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _save_or_encode(image, response_format: str, base_url: str, meta: dict) -> dict:
+def _save_output(image, base_url: str, meta: dict) -> dict:
+    """把结果写进 outputs/ 并返回 OpenAI 风格条目(带本地路径, 便于队列持久化)。"""
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     raw = buf.getvalue()
-    if response_format == "b64_json":
-        item = {"b64_json": base64.b64encode(raw).decode()}
-    else:
-        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.png"
-        (OUTPUT_DIR / name).write_bytes(raw)
-        item = {"url": f"{base_url}outputs/{name}"}
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.png"
+    path = OUTPUT_DIR / name
+    path.write_bytes(raw)
+    item = {"url": f"{base_url}outputs/{name}", "path": str(path)}
     item.update(meta)
     return item
 
@@ -338,6 +380,163 @@ def _oom_reset():
     import torch
     torch.cuda.empty_cache()
     gc.collect()
+
+
+# ---------------------------------------------------------------- 请求归一化
+class ParamError(ValueError):
+    """请求参数不合法(HTTP 400 / 任务失败原因)。"""
+
+
+def _plan_size(payload: dict, images) -> tuple:
+    """解析 (w, h, capped, ref_index_used)；编辑模式画布跟随 ref_index 那张。"""
+    try:
+        w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
+                                    payload.get("long_side"))
+        ref_index_used = None
+        if images:
+            ref_index_used, ref_img = pick_ref_image(images, payload.get("ref_index"))
+            w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
+                                        payload.get("long_side"),
+                                        ref_wh=(ref_img.width, ref_img.height))
+    except ValueError as e:
+        raise ParamError(str(e))
+    return w, h, capped, ref_index_used
+
+
+def _speed_warnings(w: int, h: int, output_resolution: int, images) -> list:
+    """尺寸相关的耗时提示(同步接口与队列任务共用)。"""
+    warnings = []
+    if max(w, h) > 1024:
+        warnings.append(
+            f"画布 {w}x{h} 超过 1024: 编辑路径下 token 数按面积增长, 耗时会明显高于文档基准"
+            f"(1024²@30步约 98s), 8GB 卡上建议降到 1024 或减少步数")
+    if images and output_resolution > 1024:
+        warnings.append(
+            f"output_resolution={output_resolution} 高于默认 1024: 参考图缩放基准越大, "
+            f"视觉编码器 prefill 越慢; 如只是想更快可设 QWEN_EDIT_OUTPUT_RESOLUTION=1024")
+    return warnings
+
+
+def _ref_warnings(images, ref_index_used: int) -> list:
+    """多参考图比例不一致的提示。"""
+    if len(images) <= 1 or ref_index_used is None or ref_index_used == len(images) - 1:
+        return []
+    last = images[-1]
+    if not last.height:
+        return []
+    ra = images[ref_index_used].width * last.height
+    rb = images[ref_index_used].height * last.width
+    if max(ra, rb) / max(1, min(ra, rb)) > 1.15:
+        return [f"参考图比例不一致：画布按第 {ref_index_used + 1} 张，管线内部按最后一张"
+                f"(第 {len(images)} 张) 推导；差异较大时条件图可能变形，"
+                f"建议统一参考图比例或用 ref_index=-1 对齐"]
+    return []
+
+
+def _build_plan(payload: dict, images, base_url: str = "") -> dict:
+    """把请求 payload 归一化成一份可直接执行的生成计划。
+
+    同步接口与队列任务走同一条路径: 所有校验只在这里做一遍,
+    计划本身是可 JSON 序列化的(参考图以本地文件名表达), 因此可以落盘复用。
+    """
+    prompt = payload.get("prompt")
+    if not prompt or not isinstance(prompt, str):
+        raise ParamError("缺少 prompt 字段")
+
+    n = int(payload.get("n", 1) or 1)
+    if n < 1 or n > 4:
+        raise ParamError("n 需在 1~4 之间")
+
+    steps = int(payload.get("steps", payload.get("num_inference_steps", DEFAULT_STEPS)))
+    if steps < 1 or steps > MAX_STEPS:
+        raise ParamError(f"steps 需在 1~{MAX_STEPS} 之间")
+
+    # 真 CFG (true_cfg_scale) 才是本管线的引导开关; 只有它 >1 且同时给了
+    # negative_prompt, 负提示词才真正参与采样。官方按无引导采样, 故默认 1.0。
+    true_cfg = payload.get("true_cfg_scale")
+    if true_cfg is None:
+        true_cfg = DEFAULT_TRUE_CFG_SCALE
+    try:
+        true_cfg = float(true_cfg)
+    except (TypeError, ValueError):
+        raise ParamError(f"true_cfg_scale 需为数字，收到: {true_cfg!r}")
+    if not 1.0 <= true_cfg <= MAX_TRUE_CFG_SCALE:
+        raise ParamError(f"true_cfg_scale 需在 1.0~{MAX_TRUE_CFG_SCALE:g} 之间，"
+                         f"收到: {true_cfg}")
+
+    negative = payload.get("negative_prompt") or None
+    warnings = []
+    if negative and true_cfg <= 1.0:
+        warnings.append(
+            f"已给出 negative_prompt，但 true_cfg_scale={true_cfg:g} ≤ 1 未启用 CFG，"
+            f"负提示词被忽略；如需生效请传 true_cfg_scale>1。"
+            f"(Qwen-Image-2.1 官方按无引导采样)")
+
+    w, h, capped, ref_index_used = _plan_size(payload, images)
+
+    # output_resolution = 管线缩放参考图的基准(与输出画布解耦)。
+    # 关键: 管线的默认 1024 意味着 1536 编辑请求也把参考图压到 1024², 会白丢细节;
+    # 但把它抬到出图长边又会让视觉编码器 + 条件 token 成平方级变慢(2026-09-30 实测
+    # 30 步编辑 3 分钟仍未出图)。故默认取 min(出图长边, 1024) —— 与文档基准一致,
+    # 只有显式传 output_resolution 或 QWEN_OUTPUT_RESOLUTION 才允许超过 1024。
+    out_res_raw = payload.get("output_resolution")
+    if out_res_raw is None:
+        out_res_raw = OUTPUT_RESOLUTION or min(max(w, h), EDIT_DEFAULT_OUTPUT_RESOLUTION)
+    try:
+        output_resolution = _clamp_output_resolution(out_res_raw)
+    except (TypeError, ValueError):
+        raise ParamError(f"output_resolution 需为正整数，收到: {out_res_raw!r}")
+
+    warnings += _speed_warnings(w, h, output_resolution, images)
+    if images:
+        warnings += _ref_warnings(images, ref_index_used)
+
+    seed = payload.get("seed")
+    seed = int(seed) if seed not in (None, "") else int.from_bytes(os.urandom(4), "big")
+
+    return {
+        "prompt": prompt,
+        "negative_prompt": negative,
+        "n": n,
+        "steps": steps,
+        "true_cfg_scale": true_cfg,
+        "seed": seed,
+        "width": w,
+        "height": h,
+        "capped": capped,
+        "output_resolution": output_resolution,
+        "transparent": bool(payload.get("transparent", False)),
+        "ref_index": ref_index_used,
+        "base_url": base_url,
+        "warnings": warnings,
+    }
+
+
+def _persist_refs(task_id: str, images) -> list:
+    """把参考图写进任务目录, 返回文件名列表(任务记录里只存文件名, 不存 base64)。"""
+    d = TASK_DIR / "refs" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    names = []
+    for i, img in enumerate(images):
+        name = f"ref{i + 1}.png"
+        img.save(d / name, format="PNG")
+        names.append(name)
+    return names
+
+
+def _load_ref_images(task: dict):
+    """从任务目录读回参考图(PIL)。"""
+    from PIL import Image
+    d = TASK_DIR / "refs" / task["id"]
+    out = []
+    for name in task.get("refs") or []:
+        p = d / name
+        if not p.is_file():
+            raise ParamError(f"参考图已丢失: {name}（请重新提交任务）")
+        img = Image.open(p)
+        img.load()
+        out.append(img)
+    return out
 
 
 # ---------------------------------------------------------------- HTTP 应用
@@ -372,10 +571,18 @@ def api_info():
     return {
         "service": "Qwen-Image-2.1",
         "endpoints": {
-            "POST /v1/images/generations": "文生图 (OpenAI 风格)",
+            "POST /v1/images/generations": "文生图 (OpenAI 风格); queue=true 或 prompts=[...] 时改为入队异步生成",
             "POST /v1/images/edits": "图片编辑 / 多参考图 (JSON + base64, 最多 10 张)",
+            "POST /v1/images/edits/json": "同上, images 亦可为本站 /outputs/ 图片路径",
             "GET /v1/models": "模型列表",
-            "GET /health": "健康检查 / 显存 / 加载状态",
+            "GET /health": "健康检查 / 显存 / 加载状态 / 队列计数",
+            "GET /api/queue": "任务队列概览与参数上限",
+            "GET /api/tasks": "任务列表 (status / limit 过滤)",
+            "GET /api/tasks/{id}": "单条任务详情",
+            "PATCH /api/tasks/{id}": "编辑未开始任务的提示词与参数",
+            "POST /api/tasks/{id}/cancel": "取消任务(未开始立即取消, 运行中到采样步边界生效)",
+            "POST /api/tasks/{id}/retry": "按原参数重新生成(新建一条任务)",
+            "DELETE /api/tasks/{id}": "删除任务及其产物",
             "GET /": "Web 使用页面",
         },
         "notes": {
@@ -383,6 +590,7 @@ def api_info():
             "multi_ref": "参考图按位置引用, 提示词里写 <image1> <image2> ... 最多 10 张",
             "output_resolution": "参考图缩放基准, 不传则跟随出图长边",
             "ref_index": "多参考图时按第几张定画布长宽比, 默认 0, -1 为最后一张",
+            "queue": "任务落盘于 outputs/tasks/tasks.json, 重启后仍在; 未开始的任务可取消/编辑/删除",
         },
         "docs": "/docs",
     }
@@ -391,6 +599,8 @@ def api_info():
 @app.get("/health")
 def health():
     import torch
+    with TASK_STORE.lock:
+        current = TASK_STORE.state["worker"].get("current")
     return {
         "status": "ok",
         "model": "Qwen-Image-2.1",
@@ -408,6 +618,8 @@ def health():
         "output_resolution": OUTPUT_RESOLUTION,
         "edit_output_resolution": EDIT_DEFAULT_OUTPUT_RESOLUTION,
         "ref_index": REF_IMAGE_INDEX,
+        "queue": TASK_STORE.counts(),
+        "current_task": current,
     }
 
 
@@ -421,17 +633,11 @@ def models():
 
 @app.post("/v1/images/generations")
 def generations(request: Request, payload: dict):
-    prompt = payload.get("prompt")
-    if not prompt or not isinstance(prompt, str):
-        raise HTTPException(400, "缺少 prompt 字段")
     return _generate(request, payload, images=None)
 
 
 @app.post("/v1/images/edits")
 def edits(request: Request, payload: dict):
-    prompt = payload.get("prompt")
-    if not prompt or not isinstance(prompt, str):
-        raise HTTPException(400, "缺少 prompt 字段")
     imgs = payload.get("images", payload.get("image"))
     if imgs is None:
         raise HTTPException(400, "缺少 images 字段 (base64 字符串或数组)")
@@ -439,8 +645,12 @@ def edits(request: Request, payload: dict):
         imgs = [imgs]
     if not isinstance(imgs, list) or not imgs:
         raise HTTPException(400, "images 需为 base64 字符串或数组")
-    if len(imgs) > 10:
-        raise HTTPException(400, "最多支持 10 张参考图")
+    if len(imgs) > MAX_REF_IMAGES:
+        raise HTTPException(400, f"最多支持 {MAX_REF_IMAGES} 张参考图")
+    if not payload.get("prompt") or not isinstance(payload.get("prompt"), str):
+        raise HTTPException(400, "缺少 prompt 字段")
+    if payload.get("prompts"):
+        raise HTTPException(400, "prompts 批量提交只支持文生图 /v1/images/generations")
     try:
         pil_images = [_b64_to_pil(s) for s in imgs]
     except ValueError as e:
@@ -448,95 +658,81 @@ def edits(request: Request, payload: dict):
     return _generate(request, payload, images=pil_images)
 
 
-def _generate(request: Request, payload: dict, images) -> dict:
-    import torch
-    prompt = payload["prompt"]
-    warnings = []                     # 非致命提示, 随响应返回(如负提示词被忽略)
-    n = int(payload.get("n", 1))
-    if n < 1 or n > 4:
-        raise HTTPException(400, "n 需在 1~4 之间")
-    steps = int(payload.get("steps", payload.get("num_inference_steps", DEFAULT_STEPS)))
-    if steps < 1 or steps > MAX_STEPS:
-        raise HTTPException(400, f"steps 需在 1~{MAX_STEPS} 之间")
-    response_format = payload.get("response_format", "url")
-    if response_format not in ("url", "b64_json"):
-        raise HTTPException(400, "response_format 只支持 url / b64_json")
-    transparent = bool(payload.get("transparent", False))
-    seed = payload.get("seed")
-    seed = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big")
-    negative = payload.get("negative_prompt")
+@app.post("/v1/images/edits/json")
+def edits_json(request: Request, payload: dict):
+    """编辑任务的 JSON 变体: images 可为 base64、data URL 或 /outputs/... 路径。
 
-    # 真 CFG (true_cfg_scale) 才是本管线的引导开关; 只有它 >1 且同时给了
-    # negative_prompt, 负提示词才真正参与采样。官方按无引导采样, 故默认 1.0。
-    true_cfg = payload.get("true_cfg_scale")
-    if true_cfg is None:
-        true_cfg = DEFAULT_TRUE_CFG_SCALE
+    与 /v1/images/edits 等价, 但允许直接把已有结果图当参考图(Web 界面「继续编辑」用)。
+    """
+    imgs = payload.get("images", payload.get("image"))
+    if imgs is None:
+        raise HTTPException(400, "缺少 images 字段")
+    if isinstance(imgs, str):
+        imgs = [imgs]
+    if not isinstance(imgs, list) or not imgs:
+        raise HTTPException(400, "images 需为字符串或数组")
+    if len(imgs) > MAX_REF_IMAGES:
+        raise HTTPException(400, f"最多支持 {MAX_REF_IMAGES} 张参考图")
+    if not payload.get("prompt") or not isinstance(payload.get("prompt"), str):
+        raise HTTPException(400, "缺少 prompt 字段")
     try:
-        true_cfg = float(true_cfg)
-    except (TypeError, ValueError):
-        raise HTTPException(400, f"true_cfg_scale 需为数字，收到: {true_cfg!r}")
-    if not 1.0 <= true_cfg <= MAX_TRUE_CFG_SCALE:
-        raise HTTPException(400, f"true_cfg_scale 需在 1.0~{MAX_TRUE_CFG_SCALE:g} 之间，"
-                                 f"收到: {true_cfg}")
-    if negative and true_cfg <= 1.0:
-        warnings.append(
-            f"已给出 negative_prompt，但 true_cfg_scale={true_cfg:g} ≤ 1 未启用 CFG，"
-            f"负提示词被忽略；如需生效请传 true_cfg_scale>1。"
-            f"(Qwen-Image-2.1 官方按无引导采样)")
-
-    try:
-        w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
-                                    payload.get("long_side"))
+        pil_images = [_ref_source_to_pil(s) for s in imgs]
     except ValueError as e:
         raise HTTPException(400, str(e))
+    return _generate(request, payload, images=pil_images)
 
-    # output_resolution = 管线缩放参考图的基准(与输出画布解耦)。
-    # 关键: 管线的默认 1024 意味着 1536 编辑请求也把参考图压到 1024², 会白丢细节;
-    # 但把它抬到出图长边又会让视觉编码器 + 条件 token 成平方级变慢(2026-09-30 实测
-    # 30 步编辑 3 分钟仍未出图)。故默认取 min(出图长边, 1024) —— 与文档基准一致,
-    # 只有显式传 output_resolution 或 QWEN_OUTPUT_RESOLUTION 才允许超过 1024。
-    out_res_raw = payload.get("output_resolution")
-    if out_res_raw is None:
-        out_res_raw = OUTPUT_RESOLUTION or min(max(w, h), EDIT_DEFAULT_OUTPUT_RESOLUTION)
-    try:
-        output_resolution = _clamp_output_resolution(out_res_raw)
-    except (TypeError, ValueError):
-        raise HTTPException(400, f"output_resolution 需为正整数，收到: {out_res_raw!r}")
 
-    # 慢在哪: 参考图的 token 要和输出 token 一起进同一个注意力序列, 而画布和参考图
-    # 尺寸都会平方级放大视觉编码器 prefill 与每步注意力开销。给个明确量级提示。
-    if max(w, h) > 1024:
-        warnings.append(
-            f"画布 {w}x{h} 超过 1024: 编辑路径下 token 数按面积增长, 耗时会明显高于文档基准"
-            f"(1024²@30步约 98s), 8GB 卡上建议降到 1024 或减少步数")
-    if images and output_resolution > 1024:
-        warnings.append(
-            f"output_resolution={output_resolution} 高于默认 1024: 参考图缩放基准越大, "
-            f"视觉编码器 prefill 越慢; 如只是想更快可设 QWEN_EDIT_OUTPUT_RESOLUTION=1024")
+def _pipeline_call_params() -> set:
+    """本版 diffusers 的 pipeline 接受哪些关键字(用于裁剪 kwargs)。"""
+    global _PIPE_CALL_PARAMS
+    if _PIPE_CALL_PARAMS is None:
+        _PIPE_CALL_PARAMS = set(inspect.signature(PIPE.__call__).parameters)
+    return _PIPE_CALL_PARAMS
 
-    ref_index_used = None
-    if images:
-        try:
-            ref_index_used, ref_img = pick_ref_image(images, payload.get("ref_index"))
-            w, h, capped = resolve_size(payload.get("size"), payload.get("aspect_ratio"),
-                                        payload.get("long_side"),
-                                        ref_wh=(ref_img.width, ref_img.height))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        # 画布比例取自 ref_index 那张, 而管线内部按最后一张推导。比例差得多时
-        # 条件图会被缩成与画布不同的形状, 这里显式提示。
-        last = images[-1]
-        if len(images) > 1 and ref_index_used != len(images) - 1 and last.height:
-            ra, rb = images[ref_index_used].width * last.height, images[ref_index_used].height * last.width
-            if max(ra, rb) / max(1, min(ra, rb)) > 1.15:
-                warnings.append(
-                    f"参考图比例不一致：画布按第 {ref_index_used + 1} 张，管线内部按最后一张"
-                    f"(第 {len(images)} 张) 推导；差异较大时条件图可能变形，"
-                    f"建议统一参考图比例或用 ref_index=-1 对齐")
 
-    real_prompt = _wrap_transparency(prompt, transparent)
-    base_url = str(request.base_url)
+def _pipeline_kwargs(base: dict) -> dict:
+    allowed = _pipeline_call_params()
+    return {k: v for k, v in base.items() if k in allowed}
 
+
+def _make_step_callback(progress):
+    """采样步回调: 每步上报进度(顺带让队列检查取消标记)。
+
+    取消就是在这里抛出 ``Canceled`` 的 —— 它顺着 pipeline 的采样栈一路上抛,
+    被队列工作线程捕获后按「已取消」收尾, 不会留下半张图。
+    """
+    if PIPE is not None and "callback_on_step_end" not in _pipeline_call_params():
+        raise RuntimeError("当前 diffusers 版本不支持 callback_on_step_end，无法安全取消任务")
+    if progress is None:
+        return None
+
+    def _cb(pipe, step_index, timestep, callback_kwargs):
+        progress(int(step_index) + 1)
+        return callback_kwargs
+
+    return _cb
+
+
+def run_generation(plan: dict, images, progress=None) -> dict:
+    """执行一份生成计划, 返回 (items, usage, warnings)。
+
+    同步 HTTP 接口与队列工作线程共用这一条路径(队列任务额外带上 progress,
+    于是可以被实时取消)。任何取消/失败都只抛异常, 由调用方决定如何记录。
+    """
+    import torch
+    w, h = int(plan["width"]), int(plan["height"])
+    steps = int(plan["steps"])
+    n = int(plan["n"])
+    seed = int(plan["seed"])
+    true_cfg = float(plan["true_cfg_scale"])
+    output_resolution = int(plan["output_resolution"])
+    negative = plan.get("negative_prompt")
+    base_url = plan.get("base_url") or f"http://{HOST}:{PORT}/"
+    real_prompt = _wrap_transparency(plan["prompt"], bool(plan.get("transparent")))
+    warnings = list(plan.get("warnings") or [])
+    capped = bool(plan.get("capped"))
+
+    step_cb = _make_step_callback(progress)
     STATE["waiting"] += 1
     t_req = time.time()
     try:
@@ -552,7 +748,6 @@ def _generate(request: Request, payload: dict, images) -> dict:
                              f"为避免服务崩溃已拒绝本次生成。请关闭其他程序后重试，"
                              f"或调低/置 0 QWEN_MIN_MEM_GB。")
             pipe = ensure_pipe()
-            # VAE 分块策略: auto=编辑或长边>1024开(否则OOM), 文生图<=1024关(消除接缝网格)
             if TILING_MODE in ("1", "on", "true", "always"):
                 pipe.vae.use_tiling = True
             elif TILING_MODE in ("0", "off", "false", "never"):
@@ -567,12 +762,13 @@ def _generate(request: Request, payload: dict, images) -> dict:
                 kwargs = dict(prompt=real_prompt, width=w, height=h,
                               num_inference_steps=steps, generator=gen,
                               true_cfg_scale=true_cfg,
-                              output_resolution=output_resolution)
+                              output_resolution=output_resolution,
+                              callback_on_step_end=step_cb)
                 if negative:
                     kwargs["negative_prompt"] = negative
                 if images is not None:
                     kwargs["image"] = images[0] if len(images) == 1 else images
-                kwargs = _filter_kwargs(pipe.__call__, kwargs)
+                kwargs = _pipeline_kwargs(kwargs)
                 try:
                     image = pipe(**kwargs).images[0]
                 except RuntimeError as e:
@@ -605,7 +801,7 @@ def _generate(request: Request, payload: dict, images) -> dict:
                             413, "显存不足(OOM)。请降低 size/steps，或设置 "
                                  "QWEN_MAX_SIDE=1024、QWEN_OFFLOAD=sequential 后重启")
                 meta = {"seed": seed + i, "width": w, "height": h, "steps": steps}
-                items.append(_save_or_encode(image, response_format, base_url, meta))
+                items.append(_save_output(image, base_url, meta))
 
             elapsed = time.time() - t0
             peak = torch.cuda.max_memory_allocated() / 1e6
@@ -621,7 +817,7 @@ def _generate(request: Request, payload: dict, images) -> dict:
             "mem_avail_gb": round(mem_avail, 1) if mem_avail is not None else None}
     if images:
         info["ref_images"] = len(images)
-        info["ref_index"] = ref_index_used
+        info["ref_index"] = plan.get("ref_index")
     if capped:
         info["note"] = f"尺寸已按 QWEN_MAX_SIDE={MAX_SIDE} 缩放"
     if warnings:
@@ -631,8 +827,417 @@ def _generate(request: Request, payload: dict, images) -> dict:
              w, h, steps, elapsed, peak, info["queue_sec"])
     for m in warnings:
         log.warning("请求提示: %s", m)
+    return items, info, warnings
+
+
+def _run_plan(plan: dict, images) -> dict:
+    """同步执行 + 组装 OpenAI 风格响应。"""
+    items, info, _ = run_generation(plan, images)
     return {"created": int(time.time()), "model": "Qwen-Image-2.1",
             "data": items, "usage": info}
+
+
+def _generate(request: Request, payload: dict, images) -> dict:
+    """HTTP 生成入口(同步, 兼容既有 OpenAI 风格调用)。
+
+    ``queue: true`` 时改为把任务交给持久化队列并立即返回(202)。
+    """
+    if _wants_queue(payload):
+        return _submit_tasks(request, payload, images)
+    try:
+        plan = _build_plan(payload, images, base_url=str(request.base_url))
+    except ParamError as e:
+        raise HTTPException(400, str(e))
+    try:
+        return _run_plan(plan, images)
+    except ParamError as e:
+        raise HTTPException(400, str(e))
+    except Canceled:
+        raise HTTPException(409, "本次生成已被取消")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("生成失败")
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+# ================================================================ 任务队列
+def _wants_queue(payload: dict) -> bool:
+    """是否走异步队列: 显式 queue=true, 或一次提交多条提示词(prompts)。"""
+    return bool(payload.get("queue")) or bool(payload.get("prompts"))
+
+
+def _submit_tasks(request: Request, payload: dict, images) -> dict:
+    """把一个请求拆成 N 条任务入队, 立即返回(不占用 HTTP 连接等 GPU)。"""
+    base = {k: v for k, v in payload.items()
+            if k not in ("prompt", "prompts", "images", "image", "queue",
+                         "title", "released", "response_format")}
+    prompts = payload.get("prompts")
+    if prompts:
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if not isinstance(prompts, list):
+            raise HTTPException(400, "prompts 需为字符串数组")
+        prompts = [str(p).strip() for p in prompts]
+        prompts = [p for p in prompts if p]
+        if not prompts:
+            raise HTTPException(400, "prompts 为空")
+        if len(prompts) > MAX_QUEUE_BATCH:
+            raise HTTPException(400, f"一次最多提交 {MAX_QUEUE_BATCH} 条任务")
+    else:
+        prompts = [payload.get("prompt")]
+
+    released = payload.get("released")
+    released = None if released is None else bool(released)
+    base_url = str(request.base_url)
+    created = []
+    for text in prompts:
+        item = dict(base)
+        item["prompt"] = text
+        try:
+            plan = _build_plan(item, images, base_url=base_url)
+        except ParamError as e:
+            raise HTTPException(400, str(e))
+        plan.pop("warnings", None)
+        plan.pop("capped", None)
+        plan.pop("base_url", None)          # 执行时按当时的服务地址重新填
+        kind = "edit" if images else "generation"
+        task = TASK_STORE.create(
+            kind=kind, prompt=str(text).strip(), params=plan,
+            ref_index=plan.get("ref_index"),
+            title=payload.get("title") or "",
+            source="api", released=released)
+        if images:
+            names = _persist_refs(task["id"], images)
+            with TASK_STORE.lock:
+                task["refs"] = names
+                TASK_STORE._touch(flush=True)
+        created.append(TASK_STORE.view(task))
+    if QUEUE:
+        QUEUE.wake()
+    log.info("已入队 %d 条任务: %s", len(created), ", ".join(t["id"] for t in created))
+    return {
+        "created": int(time.time()),
+        "model": "Qwen-Image-2.1",
+        "queued": len(created),
+        "data": [{"id": t["id"], "seq": t["seq"], "status": t["status"],
+                  "released": not t["staged"], "queue_position": t["queue_position"],
+                  "task_url": f"{base_url}api/tasks/{t['id']}"} for t in created],
+    }
+
+
+def _worker_run(task: dict, cancel: threading.Event, progress) -> dict:
+    """队列工作线程的执行体: 读回参考图 -> 生成 -> 返回产物。
+
+    progress(step) 里会检查取消标记, 命中就抛 Canceled, 由队列记为「已取消」。
+    """
+    images = _load_ref_images(task) if task.get("refs") else None
+    plan = dict(task["params"])
+    plan["base_url"] = f"http://{HOST}:{PORT}/"
+    plan.setdefault("warnings", [])
+    total = int(plan.get("steps") or 0)
+
+    def on_step(step: int) -> None:
+        progress(step, total)
+
+    items, usage, warnings = run_generation(plan, images, progress=on_step)
+    return {"outputs": items, "usage": usage, "warnings": warnings}
+
+
+def _model_usable() -> bool:
+    """队列是否可以开工: 只有模型加载失败时才停摆。
+
+    「加载中」刻意算可开工 —— 任务进入 run_generation 后会卡在 ensure_pipe()
+    里等模型就绪(等待时间计入 usage.queue_sec), 这样既不失败, 也不依赖
+    startup 的预加载线程真的在跑。加载失败时则原地等待, 免得排队任务
+    一条条撞同一个错误而全部变成 failed。
+    """
+    return STATE["load"] != "error"
+
+
+def _ensure_queue() -> QueueWorker:
+    global QUEUE
+    if QUEUE is None:
+        recovered = TASK_STORE.recover_interrupted()
+        if recovered:
+            log.warning("有 %d 条任务在上次退出时仍在运行, 已重新排队", recovered)
+        QUEUE = QueueWorker(TASK_STORE, _worker_run, can_run=_model_usable)
+        QUEUE.start()
+        threading.Thread(target=_cleanup_worker, daemon=True,
+                         name="outputs-cleanup").start()
+    return QUEUE
+
+
+def _cleanup_worker() -> None:
+    """清理无主产物(默认关闭)。
+
+    outputs/ 里可能有用户自己留下的图片、或队列接管之前生成的老图, 自动删除会误伤,
+    所以必须显式用 ``QWEN_TASK_CLEAN_ORPHANS=1`` 开启; 开启后也只清理
+    「比队列都新」且没有任何任务引用的 PNG(即生成到一半被杀留下的半成品)。
+    """
+    if os.environ.get("QWEN_TASK_CLEAN_ORPHANS", "0") not in ("1", "true", "on", "yes"):
+        return
+    if STATE["load"] not in ("ready", "loading"):
+        log.info("跳过无主产物清理（未加载模型）")
+        return
+    try:
+        ensure_pipe()
+    except Exception:
+        return
+    cleanup_orphan_outputs(TASK_STORE, OUTPUT_DIR, min_age_sec=300)
+
+
+@app.get("/api/queue", summary="任务队列概览")
+def queue_overview():
+    q = _ensure_queue()
+    with TASK_STORE.lock:
+        current = TASK_STORE.state["worker"].get("current")
+    counts = TASK_STORE.counts()
+    return {"counts": counts, "current": current, "auto_start": counts["auto_start"],
+            "worker": q.status(), "model_load": STATE["load"],
+            "max_side": MAX_SIDE, "default_steps": DEFAULT_STEPS,
+            "max_steps": MAX_STEPS, "default_true_cfg_scale": DEFAULT_TRUE_CFG_SCALE,
+            "max_true_cfg_scale": MAX_TRUE_CFG_SCALE,
+            "max_ref_images": MAX_REF_IMAGES, "max_queue_batch": MAX_QUEUE_BATCH,
+            "edit_output_resolution": EDIT_DEFAULT_OUTPUT_RESOLUTION,
+            "aspect_ratios": list(ASPECT_RATIOS)}
+
+
+@app.get("/api/tasks", summary="任务列表")
+def tasks_list(status: str = "", limit: int = 0, with_outputs: bool = True):
+    _ensure_queue()
+    items = TASK_STORE.list(status=status or None, limit=limit or None)
+    views = [TASK_STORE.view(t) for t in items]
+    if not with_outputs:
+        for v in views:
+            v.pop("outputs", None)
+    return {"counts": TASK_STORE.counts(), "tasks": views}
+
+
+@app.get("/api/tasks/{task_id}", summary="单条任务详情")
+def task_detail(task_id: str):
+    try:
+        return TASK_STORE.view(TASK_STORE.get(task_id))
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+
+
+@app.get("/api/tasks/{task_id}/refs/{name}", summary="任务的参考图")
+def task_ref(task_id: str, name: str):
+    from fastapi.responses import FileResponse
+    d = (TASK_DIR / "refs" / task_id).resolve()
+    path = (d / Path(name).name).resolve()
+    if path.parent != d or not path.is_file():
+        raise HTTPException(404, "参考图不存在")
+    return FileResponse(path, media_type="image/png")
+
+
+# 编辑任务时允许改动的字段(参考图不支持替换: 直接新建任务更清晰)
+_EDITABLE_FIELDS = ("n", "steps", "true_cfg_scale", "seed", "size", "aspect_ratio",
+                    "long_side", "output_resolution", "transparent")
+
+
+def _replan(cur: dict, payload: dict, images) -> dict:
+    """用「原参数 + 本次改动」重跑一遍归一化, 校验规则与新建任务完全一致。"""
+    raw = dict(cur["params"])
+    raw.pop("warnings", None)
+    raw.pop("capped", None)
+    raw.pop("width", None)
+    raw.pop("height", None)
+    raw.pop("base_url", None)
+    raw["prompt"] = cur["prompt"]
+    raw["negative_prompt"] = cur.get("negative_prompt")
+    raw["ref_index"] = cur.get("ref_index")
+    for k in _EDITABLE_FIELDS:
+        if k in payload:
+            raw[k] = payload[k]
+    if "prompt" in payload:
+        prompt = str(payload["prompt"] or "").strip()
+        if not prompt:
+            raise HTTPException(400, "提示词不能为空")
+        raw["prompt"] = prompt
+    if "negative_prompt" in payload:
+        raw["negative_prompt"] = payload["negative_prompt"] or None
+    # 改过尺寸类字段就把原 size 丢掉, 否则旧 size 会一直压过新设置
+    if ("size" in payload or "aspect_ratio" in payload or "long_side" in payload
+            or "width" in payload or "height" in payload):
+        raw.pop("size", None)
+        if payload.get("width") and payload.get("height"):
+            raw["size"] = f"{int(payload['width'])}x{int(payload['height'])}"
+    if "seed" in payload and payload["seed"] in (None, ""):
+        raw.pop("seed", None)
+    try:
+        plan = _build_plan(raw, images, base_url="")
+    except ParamError as e:
+        raise HTTPException(400, str(e))
+    plan.pop("warnings", None)
+    plan.pop("capped", None)
+    plan.pop("base_url", None)
+    plan["n"] = int(plan["n"])
+    return plan
+
+
+@app.patch("/api/tasks/{task_id}", summary="编辑未开始的任务")
+def task_update(task_id: str, payload: dict):
+    _ensure_queue()
+    if payload.get("images") is not None:
+        raise HTTPException(400, "参考图不支持替换，请新建任务")
+    try:
+        cur = TASK_STORE.get(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    if cur["status"] != "pending":
+        raise HTTPException(409, "只能编辑未开始的任务；其余任务请用「重新生成」")
+    images = _load_ref_images(cur) if cur.get("refs") else None
+    plan = _replan(cur, payload, images)
+    try:
+        task = TASK_STORE.update_params(
+            task_id,
+            {"prompt": plan["prompt"], "negative_prompt": plan.get("negative_prompt"),
+             "title": (str(payload.get("title")).strip() if payload.get("title") else None)},
+            ref_index=plan.get("ref_index"))
+    except TaskConflict as e:
+        raise HTTPException(409, str(e))
+    with TASK_STORE.lock:
+        task["params"] = plan
+        task["progress"] = {"step": 0, "total": int(plan.get("steps") or 0)}
+        TASK_STORE._touch(flush=True)
+    if QUEUE:
+        QUEUE.wake()
+    return TASK_STORE.view(task)
+
+
+@app.post("/api/tasks/{task_id}/cancel", summary="取消任务")
+def task_cancel(task_id: str):
+    _ensure_queue()
+    try:
+        t = TASK_STORE.cancel(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    if QUEUE:
+        QUEUE.wake()
+    return TASK_STORE.view(t)
+
+
+@app.post("/api/tasks/{task_id}/release", summary="开始单条暂存任务")
+def task_release(task_id: str):
+    _ensure_queue()
+    try:
+        t = TASK_STORE.release(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    except TaskConflict as e:
+        raise HTTPException(409, str(e))
+    if QUEUE:
+        QUEUE.wake()
+    return TASK_STORE.view(t)
+
+
+@app.post("/api/tasks/{task_id}/hold", summary="退回暂存(尚未开始)")
+def task_hold(task_id: str):
+    _ensure_queue()
+    try:
+        t = TASK_STORE.hold(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    except TaskConflict as e:
+        raise HTTPException(409, str(e))
+    return TASK_STORE.view(t)
+
+
+@app.post("/api/tasks/{task_id}/retry", summary="重新生成(新建一条任务)")
+def task_retry(task_id: str, payload: Optional[dict] = None):
+    """重新生成: 复制原任务的参数与参考图, 新建一条待开始任务。
+
+    刻意不覆盖原记录 —— 历史结果保留, 便于对比同一提示词的不同出图。
+    """
+    _ensure_queue()
+    payload = payload or {}
+    try:
+        old = TASK_STORE.get(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    if old["status"] in ("running", "canceling"):
+        raise HTTPException(409, "任务正在运行，请先取消再重新生成")
+
+    override = {k: v for k, v in payload.items()
+                if k in ("prompt", "negative_prompt", "steps", "true_cfg_scale",
+                         "n", "output_resolution", "transparent", "seed", "size",
+                         "aspect_ratio", "long_side")}
+    if override.get("prompt") is not None and not str(override["prompt"]).strip():
+        raise HTTPException(400, "提示词不能为空")
+    images = _load_ref_images(old) if old.get("refs") else None
+    plan = _replan(old, override, images)
+    if not payload.get("keep_seed"):
+        if payload.get("seed") in (None, ""):
+            plan.pop("seed", None)          # 未指定就换一批随机种子
+    new = TASK_STORE.create(kind=old["kind"], prompt=plan["prompt"], params=plan,
+                            ref_index=plan.get("ref_index"), origin=task_id,
+                            source="retry")
+    if old.get("refs"):
+        src = TASK_STORE.ref_dir(task_id)
+        dst = TASK_STORE.ref_dir(new["id"], create=True)
+        names = []
+        for name in old["refs"]:
+            if (src / name).is_file():
+                (dst / name).write_bytes((src / name).read_bytes())
+                names.append(name)
+        with TASK_STORE.lock:
+            new["refs"] = names
+            TASK_STORE._touch(flush=True)
+    if QUEUE:
+        QUEUE.wake()
+    return TASK_STORE.view(new)
+
+
+@app.delete("/api/tasks/{task_id}", summary="删除任务及其产物")
+def task_delete(task_id: str):
+    _ensure_queue()
+    try:
+        t = TASK_STORE.delete(task_id)
+    except TaskNotFound:
+        raise HTTPException(404, "任务不存在")
+    except TaskConflict as e:
+        raise HTTPException(409, str(e))
+    return {"deleted": task_id, "outputs_removed": len(t.get("outputs") or [])}
+
+
+# 注意: 这两条必须挂在 /api/queue/ 下, 不能写成 /api/tasks/delete 或
+# /api/tasks/release-all —— 那会被上面的 /api/tasks/{task_id} 参数化路由先匹配掉
+# (FastAPI 按注册顺序匹配), 于是变成「任务 ID 叫 delete 的请求」而返回 404。
+@app.post("/api/queue/delete", summary="批量删除任务")
+def queue_delete_many(payload: dict):
+    _ensure_queue()
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "ids 需为非空数组")
+    return TASK_STORE.delete_many([str(i) for i in ids])
+
+
+@app.post("/api/queue/auto-start", summary="开启/关闭「加入后自动生成」")
+def queue_auto_start(payload: dict):
+    _ensure_queue()
+    res = TASK_STORE.set_auto_start(bool(payload.get("auto_start", True)))
+    if QUEUE:
+        QUEUE.wake()
+    return res
+
+
+@app.post("/api/queue/release-all", summary="开始所有暂存任务")
+def queue_release_all():
+    _ensure_queue()
+    res = TASK_STORE.set_auto_start(True)
+    if QUEUE:
+        QUEUE.wake()
+    return res
+
+
+@app.on_event("startup")
+def _startup_queue():
+    _ensure_queue()
+    c = TASK_STORE.counts()
+    log.info("任务队列就绪: %s (共 %d 条, 待开始 %d, 暂存 %d)",
+             TASK_DIR, c["total"], c["ready"], c["staged"])
 
 
 if __name__ == "__main__":
