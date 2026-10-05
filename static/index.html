@@ -315,7 +315,8 @@
     .st-canceled { color: #8a949e; background: rgba(138, 148, 158, .14); }
 
     .clip-info { min-width: 0; }
-    .clip-title { color: #ececee; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .clip-title { color: #ececee; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+    .clip-title:hover { color: #b1f4bf; }
     .clip-meta { color: #a4a9af; padding-top: 3px; font-size: 10px; overflow-wrap: anywhere; }
     .clip-error { color: #f09191; }
     .clip-warn { color: #deb777; }
@@ -928,9 +929,11 @@
     function outputsCell(task) {
       const outputs = task.outputs || [];
       if (!outputs.length) return "";
+      // 点击只打开原图(新标签页); draggable=false 避免拖拽缩览图干扰点击
       const thumbs = outputs.slice(0, 4).map((item) =>
-        `<a href="${esc(item.url)}" target="_blank" rel="noreferrer" title="${item.width}×${item.height} seed=${item.seed}">`
-        + `<img src="${esc(item.url)}" loading="lazy" alt="结果"></a>`).join("");
+        `<a href="${esc(item.url)}" target="_blank" rel="noreferrer" draggable="false"`
+        + ` title="在新标签页打开原图 ${item.width}×${item.height} seed=${item.seed}">`
+        + `<img src="${esc(item.url)}" loading="lazy" alt="结果" draggable="false"></a>`).join("");
       const more = outputs.length > 4 ? `<span class="more">+${outputs.length - 4}</span>` : "";
       return `<div class="outputs">${thumbs}${more}</div>`;
     }
@@ -1104,6 +1107,7 @@
     }
 
     $("list").addEventListener("click", (event) => {
+      // 复选框与行内按钮各自处理, 不再冒泡到"点整行打开编辑弹窗"
       const pick = event.target.closest(".pick");
       if (pick) {
         if (pick.checked) state.selected.add(pick.dataset.id);
@@ -1116,8 +1120,27 @@
         taskAction(button.dataset.id, button.dataset.act);
         return;
       }
+      // 结果缩览图/链接只是"打开图片": 点在图上就只打开图片, 绝不顺带弹出编辑弹窗。
+      // (链接就在行内部, 事件会冒泡到行处理器, 所以必须在这里拦住。)
+      if (event.target.closest("a")) return;
+      // 其它表单控件同理
+      if (event.target.closest("input, select, textarea, label, summary")) return;
       const row = event.target.closest(".task-row");
       if (row) openEditor(row.dataset.id);
+    });
+
+    // 缩览图: 阻止任何冒泡与默认之外的副作用, 并给出去向提示
+    $("list").addEventListener("auxclick", (event) => {
+      if (event.target.closest("a")) event.stopPropagation();
+    });
+    $("list").addEventListener("mousedown", (event) => {
+      if (event.button !== 0) event.stopPropagation();
+    });
+    $("list").addEventListener("keydown", (event) => {
+      // 结果链接上按回车/空格只走链接自身行为
+      if (event.target.closest("a") && (event.key === "Enter" || event.key === " ")) {
+        event.stopPropagation();
+      }
     });
 
     $("selectAll").addEventListener("change", (event) => {

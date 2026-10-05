@@ -34,6 +34,7 @@ qwen-image/
 ├─ scripts/test_queue_gpu.py    队列 + 真模型集成测试 (需要 GPU)
 ├─ scripts/test_queue_loading.py 模型加载期入队测试 (需要 GPU)
 ├─ scripts/check_web.py   Web 页面内联脚本静态检查 (id 引用/接口路径)
+├─ scripts/test_web_clicks.py  页面点击语义测试 (点结果图不弹编辑窗)
 ├─ wheels/                torch/torchvision 本地 wheel (cu128)
 └─ venv/                  Python 3.11 虚拟环境
 ```
@@ -302,9 +303,12 @@ venv\Scripts\python.exe scripts\test_queue_gpu.py
 
 # 模型加载期间入队（需要 GPU，约 1 分钟：任务不失败，就绪后自动开始）
 venv\Scripts\python.exe scripts\test_queue_loading.py
+
+# 页面点击语义（需要 node）：点结果图只打开图片，不弹编辑窗
+venv\Scripts\python.exe scripts\test_web_clicks.py
 ```
 
-前两个脚本不碰 `outputs/` 与真实模型，可随时跑；后两个会占用 GPU。
+前两个与最后一个脚本不碰 `outputs/` 与真实模型，可随时跑；中间两个会占用 GPU。
 
 ## 模型与依赖重装（全国内镜像）
 
