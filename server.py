@@ -47,8 +47,12 @@ DEFAULT_TRUE_CFG_SCALE = float(os.environ.get("QWEN_TRUE_CFG_SCALE", "1.0"))
 MAX_TRUE_CFG_SCALE = float(os.environ.get("QWEN_MAX_TRUE_CFG_SCALE", "20"))
 # 参考图缩放基准(output_resolution): 管线按此值把每张参考图等比缩到长边上限,
 # 并与输出画布分开。不传时管线默认 1024 —— 于是 1536 的编辑请求也把参考图压到 1024²,
-# 白白丢细节。这里默认跟随出图长边, 可用 QWEN_OUTPUT_RESOLUTION 固定。
+# 白白丢细节。这里默认取 min(出图长边, EDIT_DEFAULT_OUTPUT_RESOLUTION), 兼顾细节与速度;
+# 显式设 QWEN_OUTPUT_RESOLUTION 可固定, 传 >1024 会显著变慢(见 _generate 注释)。
 OUTPUT_RESOLUTION = int(os.environ.get("QWEN_OUTPUT_RESOLUTION", "0")) or None
+# 走参考图(编辑)时, output_resolution 不显式指定下的默认上限。抬高会同时放大
+# 视觉编码器 prefill 与条件 token 数, 8GB 卡上非常慢, 故默认与文档基准 1024 对齐。
+EDIT_DEFAULT_OUTPUT_RESOLUTION = int(os.environ.get("QWEN_EDIT_OUTPUT_RESOLUTION", "1024"))
 # 多参考图时按第几张定画布长宽比(管线内部用最后一张, 本案默认第一张, 即内容/主体图)
 REF_IMAGE_INDEX = int(os.environ.get("QWEN_REF_INDEX", "0"))
 OFFLOAD = os.environ.get("QWEN_OFFLOAD", "model")                # model | sequential
@@ -402,6 +406,7 @@ def health():
         "offload": OFFLOAD,
         "default_true_cfg_scale": DEFAULT_TRUE_CFG_SCALE,
         "output_resolution": OUTPUT_RESOLUTION,
+        "edit_output_resolution": EDIT_DEFAULT_OUTPUT_RESOLUTION,
         "ref_index": REF_IMAGE_INDEX,
     }
 
@@ -485,15 +490,29 @@ def _generate(request: Request, payload: dict, images) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # output_resolution = 管线缩放参考图的基准(与输出画布解耦)。不传时默认跟随
-    # 输出长边, 否则管线会用它的默认 1024 把 1536 编辑请求的参考图压到 1024²。
+    # output_resolution = 管线缩放参考图的基准(与输出画布解耦)。
+    # 关键: 管线的默认 1024 意味着 1536 编辑请求也把参考图压到 1024², 会白丢细节;
+    # 但把它抬到出图长边又会让视觉编码器 + 条件 token 成平方级变慢(2026-09-30 实测
+    # 30 步编辑 3 分钟仍未出图)。故默认取 min(出图长边, 1024) —— 与文档基准一致,
+    # 只有显式传 output_resolution 或 QWEN_OUTPUT_RESOLUTION 才允许超过 1024。
     out_res_raw = payload.get("output_resolution")
     if out_res_raw is None:
-        out_res_raw = OUTPUT_RESOLUTION or max(w, h)
+        out_res_raw = OUTPUT_RESOLUTION or min(max(w, h), EDIT_DEFAULT_OUTPUT_RESOLUTION)
     try:
         output_resolution = _clamp_output_resolution(out_res_raw)
     except (TypeError, ValueError):
         raise HTTPException(400, f"output_resolution 需为正整数，收到: {out_res_raw!r}")
+
+    # 慢在哪: 参考图的 token 要和输出 token 一起进同一个注意力序列, 而画布和参考图
+    # 尺寸都会平方级放大视觉编码器 prefill 与每步注意力开销。给个明确量级提示。
+    if max(w, h) > 1024:
+        warnings.append(
+            f"画布 {w}x{h} 超过 1024: 编辑路径下 token 数按面积增长, 耗时会明显高于文档基准"
+            f"(1024²@30步约 98s), 8GB 卡上建议降到 1024 或减少步数")
+    if images and output_resolution > 1024:
+        warnings.append(
+            f"output_resolution={output_resolution} 高于默认 1024: 参考图缩放基准越大, "
+            f"视觉编码器 prefill 越慢; 如只是想更快可设 QWEN_EDIT_OUTPUT_RESOLUTION=1024")
 
     ref_index_used = None
     if images:

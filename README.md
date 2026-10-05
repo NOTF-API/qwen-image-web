@@ -146,12 +146,22 @@ Web 页面上的参考图缩略图会标出 `image1`、`image2`… 的序号，�
 > 容易变形；此时响应 `usage.warnings` 会给出提示。统一参考图比例，或显式传 `ref_index: -1`
 > 对齐管线内部语义即可。
 
-#### output_resolution 为什么重要
+#### output_resolution 与速度（重要）
 
-diffusers 管线是按 `output_resolution`（默认 1024）把每张参考图等比缩到长边上限的，
-**它和输出画布是两件事**。不显式传的话，`size: 1536x1536` 的编辑请求也会把参考图压到 1024²，
-白白丢掉细节。本服务默认让 `output_resolution` 跟随出图长边（1024/1536…），
-必要时也可用 `output_resolution` 显式压小以省显存。
+diffusers 管线按 `output_resolution`（默认 1024）把每张参考图等比缩到长边上限，
+**它和输出画布是两件事**。本服务默认取 `min(出图长边, 1024)`：既不会像管线默认那样
+把 1536 编辑的参考图压到 1024²（那才叫丢细节），也不会为了保细节把耗时推到不可接受。
+
+**耗时为什么随尺寸平方级增长**：参考图的 token 和输出 token 进的是**同一个注意力序列**
+（`img_shapes` 里条件图与目标图并列），画布与参考图各自翻倍 = token 数四倍，
+视觉编码器 prefill 与每步注意力开销一起涨。所以 8GB 卡上编辑建议：
+
+| 做法 | 效果 |
+|---|---|
+| `size` 保持 1024 或更小 | 与文档基准一致（1024²@30步 ≈ 98s） |
+| 步数降到 20 | 线性省时，画质损失小于降分辨率 |
+| 需要更细参考图细节才调高 `output_resolution` | 明确变慢；`usage.warnings` 会提示 |
+| 别在编辑时开浏览器/游戏 | 编辑峰值显存已达 8124~8378 MB |
 
 （实测：首次编辑含视觉编码器预热约 130~190 秒，显存峰值 **8124~8378 MB**——贴近 8GB 上限，建议编辑时不要同时开占显存的程序。编辑路径**始终使用 VAE 分块解码**（auto 策略下不分块会 OOM，2026-09-27 实测 500）。）
 
@@ -191,7 +201,8 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 | `QWEN_MAX_SIDE` | 1536 | 长边硬上限（超了自动缩放并提示） |
 | `QWEN_STEPS` | 30 | 默认步数（官方 40 更精细但更慢） |
 | `QWEN_TRUE_CFG_SCALE` | 1.0 | 默认引导强度。**1.0 = 官方无引导采样**，此时 `negative_prompt` 被忽略；设 >1 才启用 CFG（更慢）。单次请求可用 `true_cfg_scale` 覆盖 |
-| `QWEN_OUTPUT_RESOLUTION` | 跟随出图长边 | 参考图缩放基准（管线 `output_resolution`）。设 0/不设 = 自动跟随长边；显式固定可省显存。单次请求可用 `output_resolution` 覆盖 |
+| `QWEN_OUTPUT_RESOLUTION` | 跟随出图长边 | 参考图缩放基准（管线 `output_resolution`）。0/不设 = 自动（编辑器路径取 `min(出图长边, QWEN_EDIT_OUTPUT_RESOLUTION)`）。单次请求可用 `output_resolution` 覆盖 |
+| `QWEN_EDIT_OUTPUT_RESOLUTION` | 1024 | 带参考图时 `output_resolution` 的默认上限。**抬高会明显变慢**：参考图 token 与视觉编码器 prefill 都随之增长；1024 与文档耗时基准一致 |
 | `QWEN_REF_INDEX` | 0 | 多参考图时按第几张定画布长宽比（0 = 第一张；-1 = 最后一张，与管线内部语义一致）。单次请求可用 `ref_index` 覆盖 |
 | `QWEN_OFFLOAD` | model | `sequential`=更省显存更慢；`none`=显存全上卡 |
 | `QWEN_GGUF` | 自动选 Q4_K_M | 换量化档位，如 `qwen-image-2.1-Q5_K_M.gguf` |
