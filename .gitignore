@@ -1,0 +1,25 @@
+# 模型权重 (~23GB, 用 scripts/download_model.ps1 重新下载)
+model/
+*.gguf
+*.safetensors
+
+# Python 虚拟环境
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# torch 本地 wheel (SJTU 镜像可重新下载, 见 README「模型与依赖重装」)
+wheels/
+
+# 生成的图片
+outputs/
+
+# 运行日志
+*.log
+
+# IDE / 系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

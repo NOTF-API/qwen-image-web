@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen-Image-2.1 本地生图</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--text:#e8eaf0;--muted:#8b93a7;
+      --accent:#6ea8fe;--ok:#3ddc84;--warn:#ffb020;--err:#ff5d5d;--border:#2a2f3a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+     font:15px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;
+       padding:14px 20px;border-bottom:1px solid var(--border);position:sticky;top:0;
+       background:rgba(15,17,21,.92);backdrop-filter:blur(6px);z-index:10;flex-wrap:wrap}
+h1{font-size:18px;margin:0;font-weight:650}
+h1 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:12px}
+#status{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
+      background:var(--panel2);border:1px solid var(--border);white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.err{background:var(--err)}
+main{display:grid;grid-template-columns:390px 1fr;gap:18px;padding:18px;max-width:1440px;margin:0 auto}
+@media (max-width:920px){main{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;align-self:start}
+label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
+label:first-child{margin-top:0}
+textarea,input[type=number],input[type=text],select{width:100%;background:var(--panel2);
+  color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font:inherit;outline:none}
+textarea{min-height:92px;resize:vertical}
+textarea:focus,input:focus,select:focus{border-color:var(--accent)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+input[type=range]{width:100%;margin-top:14px;accent-color:var(--accent)}
+button{width:100%;margin-top:16px;padding:12px;border:none;border-radius:10px;
+       background:var(--accent);color:#0b1020;font-weight:650;font-size:15px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:hover:not(:disabled){filter:brightness(1.08)}
+#timer{text-align:center;color:var(--muted);font-size:13px;min-height:20px;margin-top:8px}
+.check{display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px;margin-top:12px}
+.check input{accent-color:var(--accent);width:16px;height:16px}
+#msg{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;word-break:break-all}
+#msg.err{display:block;background:rgba(255,93,93,.12);border:1px solid rgba(255,93,93,.4);color:#ffb3b3}
+#msg.info{display:block;background:rgba(61,220,132,.1);border:1px solid rgba(61,220,132,.35);color:#9cf0c4}
+.result-empty{color:var(--muted);text-align:center;padding:60px 20px;
+              border:1px dashed var(--border);border-radius:12px}
+img.preview{width:100%;border-radius:10px;background:#000;display:block;margin-bottom:10px}
+.meta{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin-top:10px}
+.meta b{color:var(--text);font-weight:600}
+#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+#gallery a{display:block;border:1px solid var(--border);border-radius:8px;overflow:hidden;
+           aspect-ratio:1;background:var(--panel2)}
+#gallery img{width:100%;height:100%;object-fit:cover;display:block}
+h2{font-size:13px;margin:20px 0 10px;color:var(--muted);font-weight:600;letter-spacing:.5px}
+footer{padding:4px 20px 26px;color:var(--muted);font-size:12px;text-align:center}
+footer a{color:var(--accent);text-decoration:none;margin:0 8px}
+input[type=file]{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwen-Image-2.1<small>本地生图服务 · 无需 ComfyUI</small></h1>
+  <div id="status">
+    <span class="pill"><span class="dot" id="loadDot"></span><span id="loadText">连接中…</span></span>
+    <span class="pill" id="vramPill">显存 –</span>
+    <span class="pill" id="queuePill">排队 0</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <label>提示词</label>
+    <textarea id="prompt" placeholder="描述想生成的画面，例如：雨夜里的霓虹招牌，写着 QWEN IMAGE 2.1，湿地反射，电影感灯光"></textarea>
+
+    <label>负提示词（可选）</label>
+    <textarea id="negative_prompt" style="min-height:50px" placeholder="不希望出现的元素，例如：blurry, low quality"></textarea>
+
+    <div class="row">
+      <div>
+        <label>长宽比</label>
+        <select id="ratio">
+          <option value="" selected>自动（编辑跟原图）</option>
+          <option value="1:1">1:1 方形</option>
+          <option value="4:3">4:3</option>
+          <option value="3:4">3:4</option>
+          <option value="3:2">3:2</option>
+          <option value="2:3">2:3</option>
+          <option value="16:9">16:9 横幅</option>
+          <option value="9:16">9:16 竖屏</option>
+        </select>
+      </div>
+      <div>
+        <label>步数 <b id="stepsVal" style="color:var(--text)">30</b>（质量/速度权衡）</label>
+        <input type="range" id="steps" min="1" max="60" value="30">
+        <div id="stepsWarn" style="display:none;color:var(--warn);font-size:12px;line-height:1.5;margin-top:4px">⚠ 步数过低会出糊图/格子伪影（去噪不收敛），正式出图建议 ≥20</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div><label>Seed（留空随机）</label><input type="number" id="seed" placeholder="随机"></div>
+      <div><label>张数</label>
+        <select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+      </div>
+    </div>
+
+    <label>参考图（可选，传图即走图生图 / 多参考图编辑）</label>
+    <input type="file" id="files" accept="image/*" multiple>
+
+    <div class="check">
+      <input type="checkbox" id="transparent">
+      <label for="transparent" style="margin:0;color:var(--text)">透明背景 PNG</label>
+    </div>
+
+    <button id="go" disabled>模型加载中…</button>
+    <div id="timer"></div>
+    <div id="msg"></div>
+  </section>
+
+  <section class="panel">
+    <div id="empty" class="result-empty">
+      输入提示词后点击「生成」<br><br>
+      1024×1024 / 30 步约 <b>86 秒</b>，16:9 约 49 秒<br>
+      页面顶部可随时查看加载状态与显存占用
+    </div>
+    <div id="result" style="display:none">
+      <div id="imgs"></div>
+      <div class="meta" id="meta"></div>
+      <div class="meta" id="usage" style="margin-top:2px"></div>
+    </div>
+    <div id="galleryWrap" style="display:none">
+      <h2>本次会话记录（点击看原图）</h2>
+      <div id="gallery"></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  OpenAPI 文档 <a href="/docs">/docs</a> ·
+  健康检查 <a href="/health">/health</a> ·
+  接口说明 <a href="/api">/api</a>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let ready = false, timerId = null;
+
+async function pollHealth() {
+  try {
+    const h = await fetch('/health').then(r => r.json());
+    ready = h.load === 'ready';
+    $('loadDot').className = 'dot ' + (h.load === 'ready' ? 'ok'
+      : h.load === 'loading' ? 'warn' : h.load === 'error' ? 'err' : '');
+    $('loadText').textContent = h.load === 'ready' ? '就绪'
+      : h.load === 'loading' ? '模型加载中…' : h.load === 'error' ? '加载出错' : '空闲';
+    $('vramPill').textContent = `显存 ${h.vram.used_mb} / ${h.vram.total_mb} MB`;
+    $('queuePill').textContent = '排队 ' + h.waiting;
+    if (!timerId) {
+      $('go').disabled = !ready;
+      $('go').textContent = ready ? '生成' : '模型加载中…';
+    }
+    if (h.load === 'error') show('err', '模型加载失败: ' + (h.error || '未知错误'));
+  } catch (e) {
+    $('loadDot').className = 'dot err';
+    $('loadText').textContent = '服务未连接';
+    if (!timerId) $('go').disabled = true;
+  }
+}
+
+function show(cls, text) { const m = $('msg'); m.className = cls; m.textContent = text; }
+function clearMsg() { const m = $('msg'); m.className = ''; m.textContent = ''; }
+
+function toDataURL(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+async function generate() {
+  clearMsg();
+  const prompt = $('prompt').value.trim();
+  if (!prompt) { show('err', '请输入提示词'); return; }
+
+  const body = {
+    prompt,
+    steps: +$('steps').value,
+    aspect_ratio: $('ratio').value || undefined,   // 自动=不传(文生图 1:1 / 编辑跟随原图)
+    n: +$('n').value,
+    response_format: 'url',
+  };
+  const neg = $('negative_prompt').value.trim();
+  if (neg) body.negative_prompt = neg;
+  if ($('seed').value !== '') body.seed = +$('seed').value;
+  if ($('transparent').checked) body.transparent = true;
+
+  const files = [...$('files').files];
+  let url = '/v1/images/generations';
+  if (files.length) {
+    url = '/v1/images/edits';
+    body.images = await Promise.all(files.map(toDataURL));
+  }
+
+  const btn = $('go');
+  btn.disabled = true;
+  btn.textContent = '生成中…';
+  const t0 = Date.now();
+  $('timer').textContent = '生成中 0 秒（首张含预热会更久）';
+  timerId = setInterval(() => {
+    $('timer').textContent = '生成中 ' + Math.round((Date.now() - t0) / 1000) + ' 秒（首张含预热会更久）';
+  }, 500);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (j.detail || JSON.stringify(j)));
+    render(j);
+    show('info', `完成：用时 ${j.usage.elapsed_sec}s，排队 ${j.usage.queue_sec}s，`
+       + `显存峰值 ${j.usage.vram_peak_mb}MB`
+       + (j.usage.mem_avail_gb != null ? `，可用内存 ${j.usage.mem_avail_gb}GB` : ''));
+  } catch (e) {
+    show('err', '生成失败：' + e.message);
+  } finally {
+    clearInterval(timerId); timerId = null; $('timer').textContent = '';
+    if (ready) { btn.disabled = false; btn.textContent = '生成'; }
+  }
+}
+
+function render(j) {
+  $('empty').style.display = 'none';
+  $('result').style.display = 'block';
+  $('imgs').innerHTML = j.data.map(d =>
+    `<img class="preview" src="${d.url}" loading="lazy" alt="生成结果">`).join('');
+  $('meta').innerHTML = j.data.map(d =>
+    `<span>尺寸 <b>${d.width}×${d.height}</b></span>`
+    + `<span>seed <b>${d.seed}</b></span>`
+    + `<span>步数 <b>${d.steps}</b></span>`).join('');
+  $('usage').innerHTML =
+      `<span>耗时 <b>${j.usage.elapsed_sec}s</b></span>`
+    + `<span>排队 <b>${j.usage.queue_sec}s</b></span>`
+    + `<span>显存峰值 <b>${j.usage.vram_peak_mb}MB</b></span>`
+    + (j.usage.mem_avail_gb != null ? `<span>可用内存 <b>${j.usage.mem_avail_gb}GB</b></span>` : '');
+
+  const g = $('gallery');
+  $('galleryWrap').style.display = 'block';
+  j.data.forEach(d => {
+    const a = document.createElement('a');
+    a.href = d.url; a.target = '_blank';
+    const img = document.createElement('img');
+    img.src = d.url; img.loading = 'lazy';
+    img.title = `${d.width}×${d.height} seed=${d.seed}`;
+    a.appendChild(img);
+    g.prepend(a);
+  });
+}
+
+function updateSteps() {
+  $('stepsVal').textContent = $('steps').value;
+  $('stepsWarn').style.display = +$('steps').value < 20 ? 'block' : 'none';
+}
+$('steps').addEventListener('input', updateSteps);
+updateSteps();
+$('go').addEventListener('click', generate);
+pollHealth();
+setInterval(pollHealth, 2500);
+</script>
+</body>
+</html>

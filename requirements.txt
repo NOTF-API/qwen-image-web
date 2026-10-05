@@ -1,0 +1,19 @@
+# Qwen-Image-2.1 服务依赖 (Python 3.11, Windows, RTX 5060 Ti 8GB)
+# 注意: torch/torchvision 不在此列 —— 必须用本地 cu128 wheel, 见 README「模型与依赖重装」
+#   pip install --force-reinstall --no-deps wheels\torch-2.11.0+cu128-cp311-cp311-win_amd64.whl wheels\torchvision-0.26.0+cu128-cp311-cp311-win_amd64.whl
+# diffusers 也不在此列 —— PyPI 0.40.0 没有 QwenImage21Pipeline, 需装 main:
+#   pip install "https://codeload.github.com/huggingface/diffusers/tar.gz/refs/heads/main"
+transformers==5.17.0
+accelerate==1.15.0
+bitsandbytes==0.50.2
+safetensors==0.8.0
+huggingface_hub==1.33.0
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+pillow==12.3.0
+requests==2.34.2
+numpy==2.4.6
+gguf==0.19.0                 # diffusers GGUF 加载的可选依赖(必需)
+psutil==7.2.2
+python-dotenv==1.2.3
+tqdm==4.70.1
