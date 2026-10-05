@@ -44,6 +44,46 @@ qwen-image/
 └─ venv/                  Python 3.11 虚拟环境
 ```
 
+## 快速开始
+
+> ⚠️ **首次使用请先看本节**；已经装好的直接跳到「[启动](#启动)」。
+
+**环境要求**：Windows 10/11 + Python 3.11 + NVIDIA 显卡（显存 ≥8GB，内存 ≥32GB 更稳）。
+仓库里的 `model/`、`venv/`、`wheels/` 都已在 `.gitignore` 中，**clone 下来是空的**，需要按下面 5 步准备。
+
+```powershell
+# 1) 拉代码
+git clone https://github.com/NOTF-API/qwen-image-web.git
+cd qwen-image-web
+
+# 2) 建虚拟环境 (必须 3.11)
+python -m venv venv
+venv\Scripts\python.exe -m pip install -U pip
+
+# 3) 装依赖 —— torch / diffusers 见下面第 4 步, 其余走 requirements.txt
+venv\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# 4) torch 必须用 cu128 本地 wheel, diffusers 必须用 main (PyPI 还没有 QwenImage21Pipeline)
+venv\Scripts\python.exe -m pip install --force-reinstall --no-deps `
+  "wheels\torch-2.11.0+cu128-cp311-cp311-win_amd64.whl" `
+  "wheels\torchvision-0.26.0+cu128-cp311-cp311-win_amd64.whl"
+venv\Scripts\python.exe -m pip install "https://codeload.github.com/huggingface/diffusers/tar.gz/refs/heads/main"
+
+# 5) 拉模型权重 (~23GB, ModelScope 32MB/s, 断点续传)
+powershell -ExecutionPolicy Bypass -File scripts\download_model.ps1
+```
+
+`wheels/` 里的 torch wheel 不在仓库中（`wheels/` 已 gitignore），从
+`https://mirror.sjtu.edu.cn/pytorch-wheels/cu128/` 下载后放进 `wheels/`。
+
+装完自检：
+
+```powershell
+venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+输出应类似 `2.11.0+cu128 True`。若 `False`，说明装成了 CPU 版，回到第 4 步。
+
 ## 启动
 
 ```bat
@@ -358,10 +398,8 @@ venv\Scripts\python.exe scripts\test_oom_recovery_unit.py
 # 1) 模型 (~23GB, ModelScope 32MB/s, 断点续传)
 powershell -ExecutionPolicy Bypass -File scripts\download_model.ps1
 
-# 2) 依赖 (在 venv 内)
-venv\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ^
-  "transformers>=5.17" accelerate safetensors huggingface_hub bitsandbytes ^
-  fastapi "uvicorn[standard]" pillow requests
+# 2) 依赖 (在 venv 内) —— 依赖清单以 requirements.txt 为准, 不要在这里另抄一份
+venv\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 # torch 必须用 cu128 本地 wheel (5060 Ti Blackwell sm_120 不支持 CPU 版/老 CUDA):
 venv\Scripts\python.exe -m pip install --force-reinstall --no-deps ^
   "wheels\torch-2.11.0+cu128-cp311-cp311-win_amd64.whl" ^
