@@ -49,7 +49,7 @@ start.bat
 也可以手动设 `QWEN_GGUF` 环境变量后 `python -u server.py`。
 
 启动后浏览器打开 **http://127.0.0.1:8091/** 即为可视化使用页面（提示词/长宽比/步数/
-seed/张数/透明背景/参考图上传，带加载状态、耗时统计与会话画廊）；纯 API 调用见下文。
+seed/张数/透明背景/引导强度/参考图上传，带加载状态、耗时统计与会话画廊）；纯 API 调用见下文。
 
 首次启动会在后台预加载模型（**实测冷启动 110~120 秒**），`/health` 显示
 `load: loading -> ready`。之后每次生成（RTX 5060 Ti 8GB 实测）：
@@ -76,12 +76,20 @@ seed/张数/透明背景/参考图上传，带加载状态、耗时统计与会�
   "size": "1024x1024",          // 或 "aspect_ratio": "16:9"，或 "long_side": 1280
   "steps": 30,                   // 1~60 (官方默认 40，这里默认 30)
   "seed": 42,                    // 可选，不传随机；响应带回实际 seed
-  "guidance_scale": 4.0,         // 可选，不传用管线默认值
+  "true_cfg_scale": 1.0,         // 可选，引导强度。1.0=官方默认(无引导)，>1 才启用 CFG
+  "negative_prompt": "blurry",   // 可选，但只有 true_cfg_scale>1 时才会生效(见下)
   "transparent": false,          // true = 生成透明 PNG (RGBA)
   "n": 1,                        // 1~4 张
   "response_format": "url"       // "url" | "b64_json"
 }
 ```
+
+> ⚠️ **关于 CFG 与负提示词**：Qwen-Image-2.1 是**按「无引导」采样**训练的，管线
+> `true_cfg_scale` 默认 `1.0`，此时 `negative_prompt` **会被忽略**（diffusers 内部只打一条
+> warning）。要让负提示词真正参与采样，必须**同时**给 `true_cfg_scale > 1`。代价是每步多一次
+> 前向，明显更慢；官方默认不用引导，所以除非确有必要，建议保持 `1.0`。
+> 本服务会在这种情况下于响应 `usage.warnings` 里明确告知，不再静默失败。
+> （早期版本暴露的 `guidance_scale` **不是本管线的参数**，会被静默丢弃，现已移除。）
 
 响应：
 
@@ -95,6 +103,8 @@ seed/张数/透明背景/参考图上传，带加载状态、耗时统计与会�
   ],
   "usage": { "elapsed_sec": 41.2, "vram_peak_mb": 6890, "queue_sec": 0.1,
             "vae_tiling": false,          // 本次是否用了 VAE 分块解码 (auto 策略结果)
+            "true_cfg_scale": 1.0,        // 本次实际用的引导强度 (1.0 = 无引导)
+            "output_resolution": 1024,    // 本次参考图缩放基准
             "mem_avail_gb": 2.4 }   // 生成前的系统可用内存(观测/归因用)
 }
 ```
@@ -107,11 +117,42 @@ seed/张数/透明背景/参考图上传，带加载状态、耗时统计与会�
 {
   "prompt": "把背景换成日落海滩",
   "images": ["data:image/png;base64,iVBORw0KGgo..."],
+  "steps": 30,
+  "true_cfg_scale": 1.0,          // 可选，同文生图；>1 时 negative_prompt 才生效
+  "output_resolution": 1024,      // 可选，参考图缩放基准；不传=跟随出图长边
+  "ref_index": 0                  // 可选，按第几张参考图定画布长宽比；-1 = 最后一张
+}
+```
+
+不传 `size` / `aspect_ratio` 时，画布长宽比跟随第 `ref_index` 张参考图（默认第 1 张）。
+
+#### 多参考图怎么"指哪张"
+
+模型是**按位置**引用参考图的：上传的第 N 张在提示词里就是 `<imageN>`。也就是说多张参考图
+不是"混在一起"，而是可以显式指定角色 —— 这正是官方「角色 / 产品 / 背景 / 风格各一张」的用法：
+
+```jsonc
+{
+  "prompt": "把 <image2> 的配色和画面风格应用到 <image1> 的产品上，保留 <image1> 的材质细节",
+  "images": ["<产品图 base64>", "<风格参考图 base64>"],
   "steps": 30
 }
 ```
 
-不传 `size` 时自动跟随第一张输入图的长宽比。
+Web 页面上的参考图缩略图会标出 `image1`、`image2`… 的序号，方便直接对照书写。
+
+> **参考图比例建议保持一致**：画布长宽比取自 `ref_index` 指定的那张，而 diffusers 管线内部
+> 是用**最后一张**推导条件图缩放比例的。两者比例差得多时条件图会被缩成与画布不同的形状，
+> 容易变形；此时响应 `usage.warnings` 会给出提示。统一参考图比例，或显式传 `ref_index: -1`
+> 对齐管线内部语义即可。
+
+#### output_resolution 为什么重要
+
+diffusers 管线是按 `output_resolution`（默认 1024）把每张参考图等比缩到长边上限的，
+**它和输出画布是两件事**。不显式传的话，`size: 1536x1536` 的编辑请求也会把参考图压到 1024²，
+白白丢掉细节。本服务默认让 `output_resolution` 跟随出图长边（1024/1536…），
+必要时也可用 `output_resolution` 显式压小以省显存。
+
 （实测：首次编辑含视觉编码器预热约 130~190 秒，显存峰值 **8124~8378 MB**——贴近 8GB 上限，建议编辑时不要同时开占显存的程序。编辑路径**始终使用 VAE 分块解码**（auto 策略下不分块会 OOM，2026-09-27 实测 500）。）
 
 ### 3. 其它
@@ -149,6 +190,9 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 | `QWEN_LONG_SIDE` | 1024 | 默认出图长边（8GB 卡建议 1024~1280） |
 | `QWEN_MAX_SIDE` | 1536 | 长边硬上限（超了自动缩放并提示） |
 | `QWEN_STEPS` | 30 | 默认步数（官方 40 更精细但更慢） |
+| `QWEN_TRUE_CFG_SCALE` | 1.0 | 默认引导强度。**1.0 = 官方无引导采样**，此时 `negative_prompt` 被忽略；设 >1 才启用 CFG（更慢）。单次请求可用 `true_cfg_scale` 覆盖 |
+| `QWEN_OUTPUT_RESOLUTION` | 跟随出图长边 | 参考图缩放基准（管线 `output_resolution`）。设 0/不设 = 自动跟随长边；显式固定可省显存。单次请求可用 `output_resolution` 覆盖 |
+| `QWEN_REF_INDEX` | 0 | 多参考图时按第几张定画布长宽比（0 = 第一张；-1 = 最后一张，与管线内部语义一致）。单次请求可用 `ref_index` 覆盖 |
 | `QWEN_OFFLOAD` | model | `sequential`=更省显存更慢；`none`=显存全上卡 |
 | `QWEN_GGUF` | 自动选 Q4_K_M | 换量化档位，如 `qwen-image-2.1-Q5_K_M.gguf` |
 | `QWEN_VAE_TILING` | auto | VAE 分块解码：`auto`=编辑/长边>1024 自动开，文生图≤1024 关（消除 192px 分块接缝网格，实测省 13s）；`1`=恒开（有接缝）；`0`=恒关（编辑/大图会 OOM） |
@@ -188,6 +232,9 @@ torch wheel 来源（37MB/s）：`https://mirror.sjtu.edu.cn/pytorch-wheels/cu12
 
 | 现象 | 处理 |
 |---|---|
+| 负提示词"没用" | 正常现象：Qwen-Image-2.1 按无引导采样，`true_cfg_scale` 默认 1.0，此时 `negative_prompt` 被忽略（响应 `usage.warnings` 会告知）。要生效就传 `true_cfg_scale` > 1，代价是每步多一次前向、明显变慢 |
+| 编辑时参考图细节被压掉 | 旧版没把 `output_resolution` 传给管线，管线按默认 1024 缩放参考图，`size: 1536` 也一样。现已默认跟随出图长边；如需进一步省显存可显式传小 |
+| 多参考图出图变形 / 构图被裁 | 画布比例取自 `ref_index`（默认第 1 张），而管线内部按最后一张缩放条件图。统一参考图比例，或传 `ref_index: -1` 对齐；响应 `usage.warnings` 会提示比例不一致 |
 | `/health` 一直 `loading` | 冷启动 1~3 分钟（NF4 量化 17.6GB 权重）；看服务控制台日志 |
 | `torch.cuda.is_available()=False` | torch 装成了 CPU 版，重装上面第 2 步的 cu128 wheel |
 | OOM (HTTP 413) | 降 `QWEN_MAX_SIDE=1024`，或 `QWEN_OFFLOAD=sequential`，关浏览器/游戏释放显存 |

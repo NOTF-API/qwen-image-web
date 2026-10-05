@@ -54,6 +54,16 @@ h2{font-size:13px;margin:20px 0 10px;color:var(--muted);font-weight:600;letter-s
 footer{padding:4px 20px 26px;color:var(--muted);font-size:12px;text-align:center}
 footer a{color:var(--accent);text-decoration:none;margin:0 8px}
 input[type=file]{color:var(--muted);font-size:13px}
+#refs{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:8px;margin-top:8px}
+#refs .ref{position:relative;aspect-ratio:1;border-radius:8px;overflow:hidden;
+           border:1px solid var(--border);background:var(--panel2)}
+#refs .ref img{width:100%;height:100%;object-fit:cover;display:block}
+#refs .ref span{position:absolute;left:3px;top:3px;padding:1px 5px;border-radius:5px;
+                background:rgba(0,0,0,.72);color:#fff;font-size:11px;line-height:1.5}
+#refs .ref.canvas{border-color:var(--accent)}
+#warn{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;
+      background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.4);color:#ffd18a;
+      line-height:1.6;word-break:break-word}
 </style>
 </head>
 <body>
@@ -73,6 +83,11 @@ input[type=file]{color:var(--muted);font-size:13px}
 
     <label>负提示词（可选）</label>
     <textarea id="negative_prompt" style="min-height:50px" placeholder="不希望出现的元素，例如：blurry, low quality"></textarea>
+    <div style="font-size:12px;color:var(--warn);line-height:1.5;margin-top:4px">⚠ 本模型按「无引导」采样，负提示词默认<b>不生效</b>：只有把下面的引导强度调到 &gt;1 才启用 CFG</div>
+
+    <label>引导强度 true_cfg_scale <b id="cfgVal" style="color:var(--text)">1.0（关闭）</b></label>
+    <input type="range" id="cfg" min="1" max="10" step="0.5" value="1">
+    <div style="font-size:12px;color:var(--muted);line-height:1.5;margin-top:4px">1.0 = 官方默认（无引导，最快）；&gt;1 才让负提示词参与采样，但会多一次前向、更慢</div>
 
     <div class="row">
       <div>
@@ -104,11 +119,18 @@ input[type=file]{color:var(--muted);font-size:13px}
 
     <label>参考图（可选，传图即走图生图 / 多参考图编辑）</label>
     <input type="file" id="files" accept="image/*" multiple>
+    <div style="font-size:12px;color:var(--muted);line-height:1.55;margin-top:6px">
+      模型按<b>位置</b>引用参考图，提示词里可写 <code>&lt;image1&gt;</code> <code>&lt;image2&gt;</code> …（最多 10 张），
+      例如「把 &lt;image2&gt; 的配色套到 &lt;image1&gt; 的产品上」。
+    </div>
+    <div id="refs"></div>
 
     <div class="check">
       <input type="checkbox" id="transparent">
       <label for="transparent" style="margin:0;color:var(--text)">透明背景 PNG</label>
     </div>
+
+    <div id="warn" style="display:none"></div>
 
     <button id="go" disabled>模型加载中…</button>
     <div id="timer"></div>
@@ -167,6 +189,48 @@ async function pollHealth() {
 
 function show(cls, text) { const m = $('msg'); m.className = cls; m.textContent = text; }
 function clearMsg() { const m = $('msg'); m.className = ''; m.textContent = ''; }
+function showWarn(list) {
+  const el = $('warn');
+  if (!list || !list.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.innerHTML = '<b>提示</b><br>' + list.join('<br>');
+  el.style.display = 'block';
+}
+
+// 参考图缩略图: 标注 image1..imageN (模型按此顺序引用), 并标出定画布比例的那张
+function renderRefs() {
+  const wrap = $('refs');
+  const files = [...$('files').files];
+  wrap.innerHTML = '';
+  // 注意: 下方的标记在图片实际加载后补, 避免读不到尺寸时误标第一张
+  const refs = files.map(() => {
+    const d = document.createElement('div');
+    d.className = 'ref';
+    wrap.appendChild(d);
+    return d;
+  });
+  files.forEach((f, i) => {
+    const url = URL.createObjectURL(f);
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = 'image' + (i + 1);
+    const badge = document.createElement('span');
+    badge.textContent = 'image' + (i + 1);
+    refs[i].appendChild(img);
+    refs[i].appendChild(badge);
+    img.addEventListener('load', () => {
+      // 只有比例未手动指定(留空=自动)时, 画布才跟随第一张
+      if (i === 0 && !$('ratio').value && img.naturalWidth && img.naturalHeight) {
+        refs[0].classList.add('canvas');
+        refs[0].title = '画布长宽比跟随此图 (ref_index=0)';
+      }
+    });
+  });
+}
+
+function updateCfg() {
+  const v = +$('cfg').value;
+  $('cfgVal').textContent = v <= 1 ? '1.0（关闭）' : v.toFixed(1) + '（启用 CFG）';
+}
 
 function toDataURL(file) {
   return new Promise((res, rej) => {
@@ -179,18 +243,22 @@ function toDataURL(file) {
 
 async function generate() {
   clearMsg();
+  showWarn(null);
   const prompt = $('prompt').value.trim();
   if (!prompt) { show('err', '请输入提示词'); return; }
 
+  const cfg = +$('cfg').value;
   const body = {
     prompt,
     steps: +$('steps').value,
-    aspect_ratio: $('ratio').value || undefined,   // 自动=不传(文生图 1:1 / 编辑跟随原图)
+    aspect_ratio: $('ratio').value || undefined,   // 自动=不传(文生图 1:1 / 编辑跟随参考图)
     n: +$('n').value,
     response_format: 'url',
   };
   const neg = $('negative_prompt').value.trim();
   if (neg) body.negative_prompt = neg;
+  // 1.0 是管线默认值(无引导), 不传以免噪声; >1 才真正启用 CFG
+  if (cfg > 1) body.true_cfg_scale = cfg;
   if ($('seed').value !== '') body.seed = +$('seed').value;
   if ($('transparent').checked) body.transparent = true;
 
@@ -199,6 +267,8 @@ async function generate() {
   if (files.length) {
     url = '/v1/images/edits';
     body.images = await Promise.all(files.map(toDataURL));
+    // 比例留空时统一以 image1 定画布, 与服务端默认 ref_index=0 对齐, 避免多图比例不一致
+    body.ref_index = 0;
   }
 
   const btn = $('go');
@@ -219,8 +289,10 @@ async function generate() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (j.detail || JSON.stringify(j)));
     render(j);
+    showWarn(j.usage.warnings);
     show('info', `完成：用时 ${j.usage.elapsed_sec}s，排队 ${j.usage.queue_sec}s，`
        + `显存峰值 ${j.usage.vram_peak_mb}MB`
+       + `，引导 ${j.usage.true_cfg_scale}${j.usage.true_cfg_scale > 1 ? '(CFG)' : '(无)'}`
        + (j.usage.mem_avail_gb != null ? `，可用内存 ${j.usage.mem_avail_gb}GB` : ''));
   } catch (e) {
     show('err', '生成失败：' + e.message);
@@ -243,6 +315,8 @@ function render(j) {
       `<span>耗时 <b>${j.usage.elapsed_sec}s</b></span>`
     + `<span>排队 <b>${j.usage.queue_sec}s</b></span>`
     + `<span>显存峰值 <b>${j.usage.vram_peak_mb}MB</b></span>`
+    + `<span>引导强度 <b>${j.usage.true_cfg_scale}</b></span>`
+    + (j.usage.ref_images ? `<span>参考图 <b>${j.usage.ref_images} 张</b></span>` : '')
     + (j.usage.mem_avail_gb != null ? `<span>可用内存 <b>${j.usage.mem_avail_gb}GB</b></span>` : '');
 
   const g = $('gallery');
@@ -264,6 +338,11 @@ function updateSteps() {
 }
 $('steps').addEventListener('input', updateSteps);
 updateSteps();
+$('cfg').addEventListener('input', updateCfg);
+updateCfg();
+$('files').addEventListener('change', renderRefs);
+$('ratio').addEventListener('change', renderRefs);
+renderRefs();
 $('go').addEventListener('click', generate);
 pollHealth();
 setInterval(pollHealth, 2500);
