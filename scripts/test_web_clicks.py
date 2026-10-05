@@ -35,11 +35,17 @@ def extract_js():
     html = HTML.read_text(encoding="utf-8")
     js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     # 渲染用的纯函数段: 从 paramsLine 起(含 statusBadge/rowActions/outputsCell/
-    # progressCell/rowHTML), 到 renderList 前; 再加 list 的点击处理器。
+    # progressCell/rowHTML), 到 renderList 前。
     fns = js[js.index("function paramsLine"):js.index("function renderList")]
+    # 点击处理器
     start = js.index('$("list").addEventListener("click"')
     end = js.index('$("selectAll").addEventListener')
-    return fns + "\n" + js[start:end]
+    handler = js[start:end]
+    # 图片查看器整段(常量 + 函数 + 事件绑定)
+    vstart = js.index("const viewer = {")
+    vend = js.index("// 编辑弹窗")
+    viewer = js[vstart:vend]
+    return fns + "\n" + handler + "\n" + viewer
 
 
 HARNESS = r"""
@@ -68,10 +74,12 @@ function makeEl(attrs) {
       while (node) {
         for (const sel of sels) {
           if (sel.startsWith(".") && node._classes.has(sel.slice(1))) return node;
-          if (sel === "+ '*'") continue;
           const m = sel.match(/^([a-z]+)(?:\[([a-z-]+)\])?$/i);
           if (m && node.tagName === m[1].toUpperCase()) {
-            if (!m[2] || node.dataset[m[2].replace("data-", "")] !== undefined) return node;
+            if (!m[2]) return node;
+            // 支持 [data-view] 这类属性选择器(dataset 用驼峰键)
+            const key = m[2].replace(/^data-/, "").replace(/-([a-z])/g, (s, c) => c.toUpperCase());
+            if (node.dataset && node.dataset[key] !== undefined) return node;
           }
         }
         node = node._parent;
@@ -103,7 +111,36 @@ const handlers = [];
 const listEl = {
   addEventListener(type, fn) { if (type === "click") handlers.push(fn); },
 };
-const $ = (id) => (id === "list" ? listEl : {});
+const clickHandlers = [];
+
+function makeStub(id) {
+  const el = {
+    id, textContent: "", innerHTML: "", src: "", hidden: false, open: false, title: "",
+    children: [], attrs: {}, classList: { add() {}, remove() {}, toggle() {} },
+    addEventListener(type, fn) { (el._listeners[type] ||= []).push(fn); },
+    _listeners: {},
+    setAttribute(k, v) { el.attrs[k] = v; if (k === "src") el.src = v; },
+    getAttribute(k) { return el.attrs[k]; },
+    showModal() { el.open = true; },
+    close() { el.open = false; },
+    removeAttribute(k) { delete el.attrs[k]; if (k === "src") el.src = ""; },
+  };
+  return el;
+}
+const byId = {};
+function stub(id) { return (byId[id] ||= makeStub(id)); }
+
+// 结果列缩览图(带 data-view), 用于验证点击后走查看器而不是跳转/弹窗
+const thumbLink = makeEl({ tag: "a", dataset: { view: "T9", index: "1" } });
+const thumbImg = makeEl({ tag: "img" });
+thumbLink.appendChild(thumbImg);
+
+const $ = (id) => (id === "list" ? listEl : stub(id));
+// 查看器会往 document 上挂 ← → 快捷键
+const documentKeyHandlers = [];
+const document = {
+  addEventListener(type, fn) { if (type === "keydown") documentKeyHandlers.push(fn); },
+};
 
 __HANDLER__
 
@@ -177,13 +214,94 @@ const pendingTask = Object.assign({}, doneTask, {
 const doneHTML = rowHTML(doneTask);
 const pendingHTML = rowHTML(pendingTask);
 results.renderDoneHasThumb = doneHTML.includes('href="/outputs/a.png"')
-  && doneHTML.includes("target=\"_blank\"") && doneHTML.includes("draggable=\"false\"");
+  && doneHTML.includes("draggable=\"false\"") && doneHTML.includes("data-view=\"T9\"");
+results.renderDoneNoNewTab = !doneHTML.includes("target=\"_blank\"");
 results.renderPendingHasPlaceholder = pendingHTML.includes("out-placeholder")
   && !pendingHTML.includes("<img");
 // 结果列在参数列之后、进度列之前(用顶层单元格顺序断言)
 results.renderColumnOrder = /clip-info">[\s\S]*clip-meta">[\s\S]*class="(?:outputs|out-placeholder)"[\s\S]*class="cell">[\s\S]*data-act="retry"/
   .test(doneHTML) && /class="(?:outputs|out-placeholder)"[\s\S]*class="cell">[\s\S]*data-act="retry"/
   .test(pendingHTML);
+
+// ---- 图片查看器 ----
+// 多图任务(3 张)用于验证横向列表与切换
+const multi = Object.assign({}, doneTask, {
+  id: "T10", seq: 10,
+  outputs: [
+    { url: "/outputs/a.png", width: 512, height: 512, seed: 1, steps: 4 },
+    { url: "/outputs/b.png", width: 512, height: 512, seed: 2, steps: 4 },
+    { url: "/outputs/c.png", width: 512, height: 512, seed: 3, steps: 4 },
+  ],
+});
+
+// 点缩览图: 拦截默认跳转, 并打开当前页查看器(先重置状态, 避免依赖前面用例)
+results.thumbOpensViewer = (() => {
+  state.tasks = [doneTask];
+  called.openEditor.length = 0;
+  let prevented = false;
+  let idAtClick = null;
+  listEl._event = { target: thumbImg };
+  handlers.forEach((fn) => fn({
+    target: thumbImg,
+    preventDefault() {
+      prevented = true;
+      idAtClick = state.tasks[0] && state.tasks[0].id;
+    },
+  }));
+  return prevented && idAtClick === "T9"
+    && called.openEditor.length === 0
+    && $("viewerImage").src === "/outputs/a.png"
+    && $("viewer").open === true;
+})();
+results.thumbViewerTitle = $("viewerTitle").textContent.includes("#9")
+  && $("viewerTitle").textContent.includes("a red cube")
+  && !$("viewerTitle").textContent.includes("#10");
+results.thumbPicksClickedIndex = (() => {
+  state.tasks = [multi];
+  openViewer("T10", 1);
+  const ok = $("viewerCount").textContent === "2 / 3"
+    && $("viewerImage").src === "/outputs/b.png";
+  closeViewer();
+  return ok;
+})();
+
+// 多图任务: 显示横向列表与左右切换
+state.tasks = [multi];
+openViewer("T10", 0);
+results.multiShowsStrip = $("viewerStrip").hidden === false
+  && ($("viewerStrip").innerHTML.match(/<img /g) || []).length === 3
+  && $("viewerPrev").hidden === false && $("viewerNext").hidden === false;
+results.multiCountText = $("viewerCount").textContent === "1 / 3"
+  && $("viewerMeta").textContent.includes("seed 1");
+stepViewer(1);
+results.multiNext = $("viewerImage").src === "/outputs/b.png"
+  && $("viewerCount").textContent === "2 / 3";
+stepViewer(-1);
+stepViewer(-1);
+results.multiWrap = $("viewerImage").src === "/outputs/c.png"
+  && $("viewerCount").textContent === "3 / 3";
+results.multiDownloadName = $("viewerDownload").getAttribute("download") === "c.png";
+closeViewer();
+results.closeClears = $("viewer").open === false && !$("viewerImage").src;
+
+// 单图任务: 隐藏列表与切换按钮
+state.tasks = [doneTask];
+openViewer("T9", 0);
+results.singleHidesStrip = $("viewerStrip").hidden === true
+  && $("viewerPrev").hidden === true && $("viewerNext").hidden === true;
+results.singleCountText = $("viewerCount").textContent === "1 / 1";
+
+// 键盘: 查看器打开时 ← → 切换(单图应无变化, 多图才生效)
+state.tasks = [multi];
+openViewer("T10", 0);
+documentKeyHandlers.forEach((fn) => fn({ key: "ArrowRight", preventDefault() {} }));
+results.keyboardNext = $("viewerImage").src === "/outputs/b.png";
+closeViewer();
+results.keyboardIgnoredWhenClosed = (() => {
+  const before = $("viewerImage").src;
+  documentKeyHandlers.forEach((fn) => fn({ key: "ArrowRight", preventDefault() {} }));
+  return $("viewerImage").src === before;
+})();
 
 console.log(JSON.stringify(results));
 """
@@ -214,9 +332,23 @@ def main():
         check(res["clickTitle"], "点提示词区域才打开编辑窗")
         check(res["clickPlaceholder"], "点结果列的占位符打开编辑窗")
         check(res["clickEmptyCell"], "点结果列空白处打开编辑窗")
-        check(res["renderDoneHasThumb"], "已出图任务在结果列渲染图片链接(新标签页)")
+        check(res["renderDoneHasThumb"], "已出图任务在结果列渲染可点击的缩览图")
+        check(res["renderDoneNoNewTab"], "缩览图不再 target=_blank(改为本页查看)")
         check(res["renderPendingHasPlaceholder"], "未出图任务在结果列渲染占位符")
         check(res["renderColumnOrder"], "结果列位于参数列与进度列之间")
+        check(res["thumbOpensViewer"], "点缩览图打开当前页查看器, 不跳转不弹编辑窗")
+        check(res["thumbViewerTitle"], "查看器标题显示任务号与提示词")
+        check(res["thumbPicksClickedIndex"], "点第 2 张缩览图直接显示第 2 张")
+        check(res["multiShowsStrip"], "多图任务显示横向图片列表与切换按钮")
+        check(res["multiCountText"], "查看器显示 1/3 与尺寸/seed 信息")
+        check(res["multiNext"], "下一张切换到第 2 张")
+        check(res["multiWrap"], "上一张可循环到第 3 张")
+        check(res["multiDownloadName"], "下载按钮带上正确的文件名")
+        check(res["closeClears"], "关闭查看器后清空状态")
+        check(res["singleHidesStrip"], "单图任务隐藏列表与切换按钮")
+        check(res["singleCountText"], "单图任务显示 1/1")
+        check(res["keyboardNext"], "← → 键可切换图片")
+        check(res["keyboardIgnoredWhenClosed"], "查看器关闭时不响应方向键")
         print()
         if FAILED:
             print(f"失败 {len(FAILED)} 项: {FAILED}")
