@@ -25,10 +25,15 @@ qwen-image/
 ├─ start.bat              启动入口
 ├─ static/index.html      Web 生图工作台 (GET / 直接返回)
 ├─ model/                 模型权重 (scripts/download_model.ps1 下载)
+│  ├─ transformer/        DiT 量化权重 (*.gguf, 启动菜单里选)
+│  └─ noctq/              Noct-Q 的原始 int8 单文件 (转成 GGUF 后可删, 约 7GB)
 ├─ outputs/               生成的图片
 │  └─ tasks/              任务队列落盘目录: tasks.json + refs/<任务ID>/参考图
 ├─ examples/client.mjs    JS 调用示例
 ├─ scripts/download_model.ps1   模型下载脚本 (可断点续传)
+├─ scripts/download_noctq.ps1  Noct-Q 无审查 DiT 下载 (可断点续传)
+├─ scripts/noctq_to_gguf.py    Noct-Q int8 (ComfyUI 单文件) -> GGUF 转换
+├─ scripts/check_noctq_gguf.py 校验 Noct-Q GGUF 能加载且权重与源一致 (不占 GPU)
 ├─ scripts/test_taskqueue.py    队列离线自测 (假生成, 秒级)
 ├─ scripts/test_server_queue.py 队列 HTTP 冒烟测试 (临时输出目录, 不加载模型)
 ├─ scripts/test_queue_gpu.py    队列 + 真模型集成测试 (需要 GPU)
@@ -97,6 +102,7 @@ start.bat
 | Q4_K_M | 3.9 GB | 默认，速度/质量平衡 |
 | Q5_K_S | 4.2 GB | 质量略高，速度接近 Q4 |
 | Q5_K_M | 5.0 GB | 质量最高，1024²@30步约 104 秒 |
+| `noctq-v4-Q4` | 3.9 GB | 无审查版 DiT（Noct-Q），见下文「[无审查版 DiT](#无审查版-ditnoct-q)」 |
 
 跳过菜单直接指定：`start.bat Q5_K_S`（等价 `powershell -File start.ps1 Q5_K_S`，支持部分匹配如 `Q4`）。
 也可以手动设 `QWEN_GGUF` 环境变量后 `python -u server.py`。
@@ -128,6 +134,79 @@ start.bat
 > ⚠️ **步数不要低于 12**：本模型非少步蒸馏版（官方建议 40 步），步数太少去噪不收敛，
 > 出图会是模糊色块+规则网格纹（"格子图"）。上表 2 步行仅用于速度测量，画质不可用；
 > 正式出图建议 20~40 步（默认 30）。
+
+## 无审查版 DiT（Noct-Q）
+
+除了官方的 Qwen-Image-2.1，本项目还可以挂 [Noctaluna/Noct-Q-Uncensored-Qwen-Image-2.1](https://huggingface.co/Noctaluna/Noct-Q-Uncensored-Qwen-Image-2.1)：
+只改了 DiT 权重的**无审查微调版**（写实人体、成人场景不过滤，无需 LoRA），文本编码器 / VAE /
+网页 / API / 任务队列全都复用官方那套，**服务端代码零改动**。
+
+### 装
+
+```powershell
+# 1) 下载作者的 int8 单文件 (7.26GB, 走 hf-mirror, 断点续传)
+powershell -ExecutionPolicy Bypass -File scripts\download_noctq.ps1
+
+# 2) 转成本项目能加载的 GGUF, 落进 model\transformer\ (约 1 分钟)
+venv\Scripts\python.exe scripts\noctq_to_gguf.py `
+  -i model\noctq\NoctQ_V4_int8_convrot.safetensors `
+  -o model\transformer\noctq-v4-Q4.gguf
+
+# 3) 可选: 校验 (加载全部张量跟源逐个比对, 不占 GPU)
+venv\Scripts\python.exe scripts\check_noctq_gguf.py
+```
+
+第 2 步完成后 `model\noctq\` 那 7.26GB 原始文件就可以删了（`Remove-Item -Recurse model\noctq`），
+需要重新量化时再跑一次 `download_noctq.ps1` 即可。
+
+### 用
+
+菜单里会多出 `noctq-v4-Q4.gguf`；或者 `start.bat noctq`（部分匹配）。
+`server.py` 不需要改，`QWEN_GGUF=noctq-v4-Q4.gguf` 效果相同。
+作者建议 **25 步 + cfg 3 + 负面提示词**；cfg 1（默认）大约快一倍但忽略负面提示词。
+
+实测（RTX 5060 Ti 8GB，1024×1024 / 30 步，与官方 Q4_K_M 同一提示词同一 seed 对照）：
+
+| | 耗时 | 显存峰值 |
+|---|---|---|
+| `noctq-v4-Q4` | 86~89 秒 | 7769 MB |
+| `qwen-image-2.1-Q4_K_M`（对照） | 86~88 秒 | 7769 MB |
+
+两者速度/显存基本一致（区间是多次运行的波动，不是配置差异）；对比图见 `outputs/compare_*.png`。
+
+### 为什么必须转换，不能直接用 int8 文件
+
+作者的发布格式是 **ComfyUI 的 `int8_tensorwise` 单文件**，diffusers 不认识；而且 7.26GB 的权重
+在 8GB 卡上根本放不下（本项目现有 Q5_K_M 5.0GB 已经峰值 ~6.4GB 显存）。
+
+> ⚠️ **这个格式有个大坑：ConvRot。** 它不是普通的 int8 —— 权重在量化之前，先按 `in_features`
+> 每 256 一组做了一次 **regular Hadamard 旋转**（`W_rot = (W.view(out, in//256, 256) @ H.T)`，
+> H 是 regular Hadamard 而非 Sylvester）。如果只按 `q * scale` 反量化而**不把 H 逆回去**，
+> 得到的权重**范数完全正常、与原权重却零相关**（相对误差 1.37 ≈ √2）：
+> 加载不报错、能出图、耗时显存都正常，**但画出来是纯色噪点**。
+> `scripts/check_noctq_gguf.py` 会顺带跟官方基线 GGUF 比对来兜住这种情况
+> （正常 0.04~0.13，出错 ~1.37）。
+
+转换脚本会照抄参考 GGUF 的逐张量量化类型，只把 K-quant 换成 gguf-python 能写的 legacy 类型：
+
+| 参考文件里的类型 | 转成 | 位宽 |
+|---|---|---|
+| Q4_K | Q4_0 | 4.5 → 4.5 bit |
+| Q5_K | Q5_0 | 5.5 → 5.5 bit |
+| Q6_K | Q8_0 | 6.5 → 8.5 bit |
+
+产物体积因此和参考 Q4_K_M 基本一致（3.91 GB）。
+**代价**：同体积下 Q4_0 的质量比 Q4_K_M 略低一档（实测 Q4_0 自身的量化误差约 9%）。
+想更精细只能换更贵的 legacy 类型（体积会涨），gguf-python 写不了 K-quant，llama.cpp 也还没有
+Qwen-Image-2.1 的转换支持，所以暂时到不了 Q4_K_M 的水平。
+
+### 其它
+
+- 作者另有 V3（旧版）权重，`download_noctq.ps1 -Name NoctQ_V3_base_int8_convrot.safetensors` 同理；
+  V4 是作者推荐版，成人场景命中率约为 V3 的三倍。
+- 许可：Noct-Q 沿用 **Qwen RESEARCH LICENSE AGREEMENT**，**仅限非商业用途**。
+  官方 Qwen-Image-2.1 本身的许可也请一并阅读。
+- 该权重带 NSFW 标签（`not-for-all-audiences`），请自行确认使用场景符合当地法规与平台规则。
 
 ## API
 
@@ -334,7 +413,7 @@ CORS 已全开（`*`），浏览器任意端口可直接调用。完整示例见
 | `QWEN_EDIT_OUTPUT_RESOLUTION` | 1024 | 带参考图时 `output_resolution` 的默认上限。**抬高会明显变慢**：参考图 token 与视觉编码器 prefill 都随之增长；1024 与文档耗时基准一致 |
 | `QWEN_REF_INDEX` | 0 | 多参考图时按第几张定画布长宽比（0 = 第一张；-1 = 最后一张，与管线内部语义一致）。单次请求可用 `ref_index` 覆盖 |
 | `QWEN_OFFLOAD` | model | `sequential`=更省显存更慢；`none`=显存全上卡 |
-| `QWEN_GGUF` | 自动选 Q4_K_M | 换量化档位，如 `qwen-image-2.1-Q5_K_M.gguf` |
+| `QWEN_GGUF` | 自动选 Q4_K_M | 换量化档位，如 `qwen-image-2.1-Q5_K_M.gguf`；也可选 `noctq-v4-Q4.gguf`（无审查版） |
 | `QWEN_VAE_TILING` | auto | VAE 分块解码：`auto`=编辑/长边>1024 自动开，文生图≤1024 关（消除 192px 分块接缝网格，实测省 13s）；`1`=恒开（有接缝）；`0`=恒关（编辑/大图会 OOM） |
 | `QWEN_MODEL_DIR` | `./model` | 模型目录 |
 | `QWEN_OUTPUT_DIR` | `./outputs` | 出图目录（队列的 `tasks/` 也放在这里） |
@@ -384,9 +463,14 @@ venv\Scripts\python.exe scripts\check_api_doc.py
 
 # OOM 后自动恢复的控制流（不占 GPU，秒级：直接注入「状态损坏」异常验证恢复逻辑）
 venv\Scripts\python.exe scripts\test_oom_recovery_unit.py
+
+# 校验 Noct-Q 转出来的 GGUF（不占 GPU，约 1 分钟：走 server.py 的加载路径，再把全部
+# 张量跟源 int8 和官方基线 GGUF 各比对一遍。需要已下载并转换过 Noct-Q）
+venv\Scripts\python.exe scripts\check_noctq_gguf.py
 ```
 
-前两个与最后一个脚本不碰 `outputs/` 与真实模型，可随时跑；中间两个会占用 GPU。
+前两个与倒数第二个脚本不碰 `outputs/` 与真实模型，可随时跑；中间两个会占用 GPU；
+最后一个只读模型文件、不占显存，跑之前需要先装好 Noct-Q。
 
 > `test_api_live.py` 只做**功能验证**，真出图一律压到最小分辨率（≤256px、≤8 步），
 > 免得一轮测试把 GPU 占满。想看出图效果请用网页或 `examples/client.mjs`。
