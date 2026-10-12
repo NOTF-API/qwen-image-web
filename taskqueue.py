@@ -92,6 +92,9 @@ class TaskStore:
     # ------------------------------------------------------------ 读写
     def _load(self):
         if not self.path.is_file():
+            # 首次启动本来就没有这个文件, 但也可能是队列目录被误删后重建的 ——
+            # 留一条 info, 否则历史凭空消失时用户只能对着空队列猜原因。
+            log.info("未找到 %s, 队列从空开始", self.path)
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -116,7 +119,13 @@ class TaskStore:
         self.state["next_seq"] = int(raw.get("next_seq", len(self.state["tasks"]) + 1) or 1)
 
     def _flush(self):
-        """原子写盘(调用方需持有 self.lock)。"""
+        """原子写盘(调用方需持有 self.lock)。
+
+        ``self.root`` 可能已被人在服务运行期间整个删掉(误删 outputs/tasks/ 是常见操作),
+        此时 tmp.write_text 会因父目录不存在抛 FileNotFoundError, 连带把出图线程打挂。
+        所以每次写盘前都确保目录还在 —— 目录没了就当新建, 队列从头开始。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         data = json.dumps(self.state, ensure_ascii=False, indent=1)
         tmp.write_text(data, encoding="utf-8")

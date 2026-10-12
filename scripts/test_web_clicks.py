@@ -191,6 +191,108 @@ def check_viewer_title_layout():
             FAILED.append(f"flex 布局在 {width}px 下压扁了按钮")
 
 
+# ============================================================ 空队列也要画出来
+# 回归: 删掉 outputs/tasks 后队列为空, 页面却永远停在「正在读取任务队列」。
+# 根因是 refreshTasks 的签名去重 —— signatureOf([]) 是 "", 而 lastSignature 初值
+# 也是 "", 于是首次 refreshTasks(false) 认为「没变化」跳过 renderList()。
+EMPTY_QUEUE_HARNESS = r"""
+// 只取页面里真正决定「要不要重绘」的那两个函数, 其余全部替身。
+__REFRESH_JS__
+
+let renderCount = 0;
+let queueResponse = { tasks: [], counts: { total: 0 } };
+function renderList() { renderCount++; }
+function renderStats() {}
+function sortTasks(list) { return list; }
+function api() { return Promise.resolve(queueResponse); }
+function setStatus() {}
+
+async function main() {
+  const results = {};
+
+  // 场景一: 首屏就拿到空队列(删掉 tasks/ 目录后的真实状态)
+  state.tasks = [];
+  state.lastSignature = __INITIAL_SIG__;
+  renderCount = 0;
+  queueResponse = { tasks: [], counts: { total: 0 } };
+  await refreshTasks(false);
+  results.emptyQueueRendersOnFirstLoad = renderCount > 0;
+
+  // 场景二: 队列非空时仍然正常渲染
+  state.tasks = [];
+  state.lastSignature = __INITIAL_SIG__;
+  renderCount = 0;
+  queueResponse = { tasks: [{ id: "x1", status: "pending", seq: 1 }], counts: { total: 1 } };
+  await refreshTasks(false);
+  results.nonEmptyQueueRenders = renderCount > 0;
+
+  // 场景三: 签名去重仍然生效(内容没变就不重复重绘, 别把修复做成每次轮询都重画)
+  renderCount = 0;
+  await refreshTasks(false);
+  results.unchangedQueueSkipsRedraw = renderCount === 0;
+
+  console.log(JSON.stringify(results));
+}
+
+main().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def check_empty_queue_render():
+    """空队列必须渲染出「队列为空」, 而不是卡在首屏占位符。
+
+    ``lastSignature`` 初值若与 ``signatureOf([])`` 相同(都是 "")，首屏空队列
+    会被签名去重误判成「没变化」, renderList() 一次都不跑。
+    """
+    js = page_js()
+    refresh = js[js.index("function signatureOf"):js.index("// ============================================================\n    // 行内操作")]
+    # 抄页面自己的初值, 而不是这里写死一个 —— 否则页面改回去测试还照样通过
+    match = re.search(r"lastSignature: (null|\"\"),", js)
+    if not match:
+        raise RuntimeError("找不到页面里的 lastSignature 初值")
+    initial = match.group(1)
+    check(initial == "null",
+          "state.lastSignature 初值是 null(不能是 \"\", 否则空队列首屏不重绘)",
+          f"实际是 {initial}")
+
+    # 这里要页面原样的 state(不替身 selected): 被测的就是首屏那个初始值本身
+    block = re.search(r"const state = \{(.*?)\n    \};", js, re.S)
+    if not block:
+        raise RuntimeError("找不到页面里的 state 初始化代码")
+    state_decl = "const state = {" + block.group(1) + "\n    };\n"
+
+    node = str(NODE) if NODE and NODE.is_file() else shutil.which("node")
+    if not node:
+        print("[SKIP] 找不到 node, 跳过空队列渲染测试")
+        return
+    harness = (EMPTY_QUEUE_HARNESS
+               .replace("__REFRESH_JS__", refresh)
+               .replace("__INITIAL_SIG__", initial)
+               .replace("let renderCount = 0;",
+                        state_decl + "\nlet renderCount = 0;"))
+    tmp = Path(tempfile.mkdtemp(prefix="qwen-empty-queue-"))
+    try:
+        script = tmp / "empty_queue.js"
+        script.write_text(harness, encoding="utf-8")
+        proc = subprocess.run([node, str(script)], capture_output=True, text=True,
+                              encoding="utf-8", timeout=60)
+        if proc.returncode != 0:
+            check(False, "空队列渲染测试执行成功", (proc.stderr or "")[-800:])
+            return
+        lines = [l for l in proc.stdout.splitlines() if l.strip().startswith("{")]
+        if not lines:
+            check(False, "空队列渲染测试有结果输出", proc.stdout[-400:])
+            return
+        res = json.loads(lines[-1])
+        check(res["emptyQueueRendersOnFirstLoad"],
+              "首屏队列为空时也会渲染(不再停在「正在读取任务队列」)")
+        check(res["nonEmptyQueueRenders"], "队列非空时正常渲染")
+        check(res["unchangedQueueSkipsRedraw"],
+              "内容未变时仍跳过重绘(签名去重没被修复破坏)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ============================================================ Node 侧测试脚本
 HARNESS = r"""
 // ---------------------------------------------------------------- 极简 DOM
@@ -920,6 +1022,7 @@ def main():
 
         check_viewer_title_css()
         check_viewer_title_layout()
+        check_empty_queue_render()
 
         print()
         if FAILED:

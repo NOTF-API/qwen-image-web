@@ -750,7 +750,10 @@
       editTaskId: null,
       editFinished: false,
       editFollowRef: false,
-      lastSignature: "",
+      // 必须用 null 而不是 "": signatureOf([]) 对空队列返回 ""(空数组 join),
+      // 若初值也是 "", 首次 refreshTasks(false) 会认为「签名没变」而跳过 renderList(),
+      // 队列为空时列表就永远停在 HTML 里的「正在读取任务队列」占位符上。
+      lastSignature: null,
       busy: false,
     };
 
